@@ -5,10 +5,14 @@ import React, {
   useRef,
   useState,
 } from 'react'
+import {
+  Copy, Scissors, ClipboardPaste, Trash2, Pencil,
+  MousePointer2, Cable, Package, Download, Upload,
+  RotateCcw, X, Check, Undo2,
+} from 'lucide-react'
 
 /* =====================================================================
- *  LogicCraft — Light Blueprint Theme (complete rewrite)
- *  Single-file, self-contained React component.
+ *  LogicCraft — Blueprint Theme (fully working custom-chip engine)
  * ===================================================================== */
 
 type PinSide = 'in' | 'out'
@@ -37,6 +41,7 @@ interface ChipDefinition {
   id: string
   name: string
   color: string
+  bgTint?: string
   builtin?: boolean
   nodes: CircuitNode[]
   wires: Wire[]
@@ -59,10 +64,15 @@ interface EditSession {
   snapSelected: Set<string>
   snapCamera: Camera
 }
+interface HistoryEntry { nodes: CircuitNode[]; wires: Wire[] }
 
-interface HistoryEntry {
-  nodes: CircuitNode[]
-  wires: Wire[]
+interface ContextMenuState {
+  x: number
+  y: number
+  world: Vec2
+  target: 'canvas' | 'node' | 'wire' | 'chip'
+  nodeId?: string
+  wireId?: string
 }
 
 const pinKey = (n: string, p: string) => `${n}:${p}`
@@ -73,7 +83,7 @@ const isPinRefEqual = (a: PinRef, b: PinRef) =>
 /* Geometry                                                            */
 /* ------------------------------------------------------------------ */
 const GRID = 24
-const NODE_W = 100
+const NODE_W = 104
 const NODE_PAD = 14
 const PIN_SPACING = 26
 const PIN_R = 5.5
@@ -226,6 +236,7 @@ function buildRsLatch(): ChipDefinition {
     id: 'builtin-rs-latch',
     name: 'RS Latch',
     color: '#0ea5e9',
+    bgTint: '#f0f9ff',
     builtin: true,
     inputNodeIds: [R.id, S.id],
     outputNodeIds: [Q.id, Qbar.id],
@@ -256,6 +267,7 @@ function buildDLatch(rs: ChipDefinition): ChipDefinition {
     id: 'builtin-d-latch',
     name: 'D Latch',
     color: '#8b5cf6',
+    bgTint: '#f5f3ff',
     builtin: true,
     inputNodeIds: [D.id, EN.id],
     outputNodeIds: [Q.id, Qbar.id],
@@ -280,7 +292,7 @@ function makeBuiltInChips(): ChipDefinition[] {
 }
 
 /* ------------------------------------------------------------------ */
-/* Compiler – full recursive flattening with isolation                 */
+/* Compiler – FULL recursive flattening (the critical fix)             */
 /* ------------------------------------------------------------------ */
 interface CompiledGate {
   key: string
@@ -294,16 +306,18 @@ interface CompiledCircuit {
   pinNets: Record<string, string | null>
 }
 
-const MAX_DEPTH = 20
+const MAX_DEPTH = 24
 
 function compileCircuit(
   circuit: { nodes: CircuitNode[]; wires: Wire[] },
   chips: Record<string, ChipDefinition>,
 ): CompiledCircuit {
   const gates: CompiledGate[] = []
-  const drivers = new Map<string, string>()
-  const aliases = new Map<string, string>()
+  const drivers = new Map<string, string>()          // input-port → driving output-port
+  const aliases = new Map<string, string>()          // chip-boundary redirects
   const inputNets: Record<string, string> = {}
+  // CRITICAL: collect real input-pin keys for EVERY gate, including nested ones
+  const gateInputKeys = new Map<string, string[]>()
 
   const walk = (c: { nodes: CircuitNode[]; wires: Wire[] }, prefix: string, depth: number) => {
     for (const w of c.wires) {
@@ -317,14 +331,16 @@ function compileCircuit(
       switch (node.kind) {
         case 'AND':
         case 'OR':
-        case 'NOT':
-          gates.push({
-            key: id,
-            type: node.kind,
-            inputs: node.inputs.map(() => null),
-            out: pinKey(id, node.outputs[0].id),
-          })
+        case 'NOT': {
+          const outKey = pinKey(id, node.outputs[0].id)
+          gates.push({ key: id, type: node.kind, inputs: [], out: outKey })
+          // record the exact input pin keys for this gate (nested or not)
+          gateInputKeys.set(
+            id,
+            node.inputs.map((p) => pinKey(id, p.id)),
+          )
           break
+        }
         case 'INPUT':
           if (prefix === '') inputNets[node.id] = pinKey(id, 'out')
           break
@@ -334,9 +350,11 @@ function compileCircuit(
           const chip = node.chipId ? chips[node.chipId] : undefined
           if (!chip || depth >= MAX_DEPTH) break
           const inner = `${id}/`
+          // external input pin  ←→  internal INPUT node output
           chip.inputNodeIds.forEach((innerId, i) => {
             aliases.set(pinKey(inner + innerId, 'out'), pinKey(id, `i${i}`))
           })
+          // external output pin  ←→  internal OUTPUT node input
           chip.outputNodeIds.forEach((innerId, i) => {
             aliases.set(pinKey(id, `o${i}`), pinKey(inner + innerId, 'in'))
           })
@@ -348,12 +366,14 @@ function compileCircuit(
   }
   walk(circuit, '', 0)
 
+  // Resolve any key to its ultimate driving terminal net (or null)
   const memo = new Map<string, string | null>()
   const resolveOut = (outKey: string, seen: Set<string>): string | null => {
     if (memo.has(outKey)) return memo.get(outKey)!
     const alias = aliases.get(outKey)
     if (alias) {
-      const v = resolveOut(alias, seen)
+      // alias always points at an input-side port → resolve as input
+      const v = netOfInput(alias, seen)
       memo.set(outKey, v)
       return v
     }
@@ -364,7 +384,17 @@ function compileCircuit(
     if (seen.has(inKey)) return null
     seen.add(inKey)
     const drive = drivers.get(inKey)
-    if (drive === undefined) return null
+    if (drive === undefined) {
+      // maybe this input is itself an alias (chip boundary)
+      const alias = aliases.get(inKey)
+      if (alias) {
+        const v = netOfInput(alias, seen)
+        seen.delete(inKey)
+        return v
+      }
+      seen.delete(inKey)
+      return null
+    }
     const result = resolveOut(drive, seen)
     seen.delete(inKey)
     return result
@@ -376,29 +406,28 @@ function compileCircuit(
     return v
   }
 
-  const gateNodeInputs = new Map<string, string[]>()
-  for (const node of circuit.nodes) {
-    if (node.kind === 'AND' || node.kind === 'OR' || node.kind === 'NOT') {
-      gateNodeInputs.set(node.id, node.inputs.map((p) => pinKey(node.id, p.id)))
-    }
-  }
+  // Wire every gate – including those deep inside custom chips
   for (const g of gates) {
-    const keys = gateNodeInputs.get(g.key) ?? []
+    const keys = gateInputKeys.get(g.key) ?? []
     g.inputs = keys.map((k) => resolveIn(k))
   }
 
+  // Visible top-level pin nets (for rendering)
   const pinNets: Record<string, string | null> = {}
   for (const node of circuit.nodes) {
-    for (const p of node.inputs) pinNets[pinKey(node.id, p.id)] = resolveIn(pinKey(node.id, p.id))
-    for (const p of node.outputs) pinNets[pinKey(node.id, p.id)] = resolveOut(pinKey(node.id, p.id), new Set())
+    for (const p of node.inputs)
+      pinNets[pinKey(node.id, p.id)] = resolveIn(pinKey(node.id, p.id))
+    for (const p of node.outputs)
+      pinNets[pinKey(node.id, p.id)] = resolveOut(pinKey(node.id, p.id), new Set())
   }
+
   return { gates, inputNets, pinNets }
 }
 
 /* ------------------------------------------------------------------ */
 /* Simulator                                                           */
 /* ------------------------------------------------------------------ */
-const SETTLE_PASSES = 72
+const SETTLE_PASSES = 80
 const SIM_TPS = 60
 
 class Simulator {
@@ -455,7 +484,8 @@ class Simulator {
 
   snapshot(): SignalMap {
     const out: SignalMap = {}
-    for (const [k, net] of Object.entries(this.compiled.pinNets)) out[k] = this.read(net)
+    for (const [k, net] of Object.entries(this.compiled.pinNets))
+      out[k] = this.read(net)
     return out
   }
 }
@@ -467,10 +497,15 @@ const CHIP_ACCENTS = [
   '#2563eb', '#059669', '#d97706', '#dc2626', '#7c3aed',
   '#0891b2', '#be185d', '#4f46e5', '#0d9488', '#b45309',
 ]
+const CHIP_TINTS = [
+  '#eff6ff', '#ecfdf5', '#fffbeb', '#fef2f2', '#f5f3ff',
+  '#ecfeff', '#fdf2f8', '#eef2ff', '#f0fdfa', '#fff7ed',
+]
 
 function packageSelectionInto(
   name: string,
   color: string,
+  bgTint: string,
   nodes: CircuitNode[],
   wires: Wire[],
   selected: Set<string>,
@@ -487,6 +522,7 @@ function packageSelectionInto(
     id: existingId ?? uid('chip'),
     name,
     color,
+    bgTint,
     builtin: false,
     inputNodeIds: inputs.map((n) => n.id),
     outputNodeIds: outputs.map((n) => n.id),
@@ -502,7 +538,7 @@ function centroidOf(nodes: CircuitNode[]): Vec2 {
 }
 
 /* ------------------------------------------------------------------ */
-/* Renderer – Blueprint / Paper                                        */
+/* Renderer – Blueprint                                                */
 /* ------------------------------------------------------------------ */
 const CANVAS_BG = '#f1f5f9'
 const GRID_DOT = '#cbd5e1'
@@ -534,7 +570,7 @@ function drawGrid(
   left: number, top: number, right: number, bottom: number, zoom: number,
 ) {
   ctx.fillStyle = GRID_DOT
-  const r = clamp(1.1 / zoom, 0.6, 1.5)
+  const r = clamp(1.1 / zoom, 0.55, 1.4)
   const x0 = Math.floor(left / GRID) * GRID
   const y0 = Math.floor(top / GRID) * GRID
   for (let x = x0; x < right; x += GRID) {
@@ -555,6 +591,7 @@ function drawBody(
   ctx: CanvasRenderingContext2D,
   n: CircuitNode,
   accent: string | null,
+  bgTint: string | null,
   selected: boolean,
   zoom: number,
 ) {
@@ -567,22 +604,25 @@ function drawBody(
     ctx.stroke()
     ctx.restore()
   }
-  // white body
-  ctx.fillStyle = BODY_FILL
+
+  // body fill (optional pastel tint)
+  ctx.fillStyle = bgTint ?? BODY_FILL
   roundRect(ctx, b.x, b.y, b.w, b.h, 8)
   ctx.fill()
-  // crisp black border
+
+  // crisp border
   ctx.strokeStyle = BODY_EDGE
   ctx.lineWidth = 1.6
   roundRect(ctx, b.x, b.y, b.w, b.h, 8)
   ctx.stroke()
-  // colored header banner – strictly inside
+
+  // accent header – clipped strictly inside the rounded rect
   if (accent) {
     ctx.save()
-    roundRect(ctx, b.x + 1.5, b.y + 1.5, b.w - 3, 5, 4)
+    roundRect(ctx, b.x, b.y, b.w, b.h, 8)
     ctx.clip()
     ctx.fillStyle = accent
-    ctx.fillRect(b.x + 1.5, b.y + 1.5, b.w - 3, 5)
+    ctx.fillRect(b.x, b.y, b.w, 6)
     ctx.restore()
   }
 }
@@ -592,21 +632,20 @@ function drawNode(
   n: CircuitNode,
   selected: boolean,
   signal: SignalMap,
-  chipColour: Record<string, string>,
+  chipMeta: Record<string, { color: string; bgTint?: string }>,
   zoom: number,
 ) {
   const b = nodeBox(n)
 
-  // ---------- INPUT (prominent toggle) ----------
+  // ---------- INPUT ----------
   if (n.kind === 'INPUT') {
-    drawBody(ctx, n, null, selected, zoom)
+    drawBody(ctx, n, null, null, selected, zoom)
     const value = !!n.value
-    const btnW = 42
-    const btnH = 22
+    const btnW = 44
+    const btnH = 24
     const bx = n.position.x + NODE_W - btnW - 12
     const by = n.position.y + (b.h - btnH) / 2
 
-    // button background
     ctx.fillStyle = value ? '#2563eb' : '#e2e8f0'
     roundRect(ctx, bx, by, btnW, btnH, 6)
     ctx.fill()
@@ -614,14 +653,12 @@ function drawNode(
     ctx.lineWidth = 1.2
     ctx.stroke()
 
-    // ON / OFF text
     ctx.fillStyle = value ? '#ffffff' : '#475569'
     ctx.font = '700 10px ui-sans-serif, system-ui, sans-serif'
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
     ctx.fillText(value ? 'ON' : 'OFF', bx + btnW / 2, by + btnH / 2 + 0.5)
 
-    // label
     ctx.fillStyle = LABEL
     ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif'
     ctx.textAlign = 'left'
@@ -629,20 +666,20 @@ function drawNode(
     return
   }
 
-  // ---------- OUTPUT (large LED) ----------
+  // ---------- OUTPUT ----------
   if (n.kind === 'OUTPUT') {
-    drawBody(ctx, n, null, selected, zoom)
+    drawBody(ctx, n, null, null, selected, zoom)
     const value = !!signal[pinKey(n.id, n.inputs[0]?.id ?? 'in')]
     const cy = n.position.y + b.h / 2
-    const cx = n.position.x + NODE_W - 26
+    const cx = n.position.x + NODE_W - 28
 
     if (value) {
       ctx.save()
-      ctx.shadowColor = 'rgba(37,99,235,0.55)'
+      ctx.shadowColor = 'rgba(37,99,235,0.5)'
       ctx.shadowBlur = 14
     }
     ctx.beginPath()
-    ctx.arc(cx, cy, 11, 0, Math.PI * 2)
+    ctx.arc(cx, cy, 12, 0, Math.PI * 2)
     ctx.fillStyle = value ? '#2563eb' : '#cbd5e1'
     ctx.fill()
     ctx.strokeStyle = value ? '#1d4ed8' : '#94a3b8'
@@ -650,10 +687,9 @@ function drawNode(
     ctx.stroke()
     if (value) ctx.restore()
 
-    // inner highlight
     if (value) {
       ctx.beginPath()
-      ctx.arc(cx - 3, cy - 3, 3.5, 0, Math.PI * 2)
+      ctx.arc(cx - 3.5, cy - 3.5, 3.8, 0, Math.PI * 2)
       ctx.fillStyle = 'rgba(255,255,255,0.55)'
       ctx.fill()
     }
@@ -668,18 +704,20 @@ function drawNode(
 
   // ---------- CHIP ----------
   if (n.kind === 'CHIP') {
-    const accent = (n.chipId ? chipColour[n.chipId] : null) ?? '#6366f1'
-    drawBody(ctx, n, accent, selected, zoom)
+    const meta = n.chipId ? chipMeta[n.chipId] : undefined
+    const accent = meta?.color ?? '#6366f1'
+    const tint = meta?.bgTint ?? null
+    drawBody(ctx, n, accent, tint, selected, zoom)
     ctx.fillStyle = LABEL
     ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif'
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
-    ctx.fillText(n.label, n.position.x + b.w / 2, n.position.y + b.h / 2 + 1)
+    ctx.fillText(n.label, n.position.x + b.w / 2, n.position.y + b.h / 2 + 2)
     return
   }
 
   // ---------- gates ----------
-  drawBody(ctx, n, null, selected, zoom)
+  drawBody(ctx, n, null, null, selected, zoom)
   const cx = n.position.x + b.w / 2
   const cy = n.position.y + b.h / 2
   const glyph = n.kind === 'AND' ? '∧' : n.kind === 'OR' ? '∨' : '¬'
@@ -721,7 +759,7 @@ function drawScene(
   signal: SignalMap,
   selected: Set<string>,
   hoverWireId: string | null,
-  chipColour: Record<string, string>,
+  chipMeta: Record<string, { color: string; bgTint?: string }>,
   pending: { start: PinRef; startPos: Vec2; end: Vec2 } | null,
   box: { x: number; y: number; w: number; h: number } | null,
   placing: { x: number; y: number; label: string; colour: string } | null,
@@ -772,7 +810,8 @@ function drawScene(
     ctx.setLineDash([])
   }
 
-  for (const n of nodes) drawNode(ctx, n, selected.has(n.id), signal, chipColour, zoom)
+  for (const n of nodes)
+    drawNode(ctx, n, selected.has(n.id), signal, chipMeta, zoom)
 
   for (const n of nodes) {
     for (const pin of enumeratePins(n)) {
@@ -828,7 +867,7 @@ function drawScene(
 /* ------------------------------------------------------------------ */
 /* Persistence                                                         */
 /* ------------------------------------------------------------------ */
-const STORAGE_KEY = 'logiccraft.blueprint.v1'
+const STORAGE_KEY = 'logiccraft.blueprint.v2'
 
 interface SavedState {
   nodes: CircuitNode[]
@@ -890,8 +929,10 @@ export default function LogicSimulator() {
   const [createModal, setCreateModal] = useState(false)
   const [chipName, setChipName] = useState('My Chip')
   const [chipColor, setChipColor] = useState(CHIP_ACCENTS[0])
+  const [chipTint, setChipTint] = useState(CHIP_TINTS[0])
   const [history, setHistory] = useState<HistoryEntry[]>([])
   const [clipboard, setClipboard] = useState<{ nodes: CircuitNode[]; wires: Wire[] } | null>(null)
+  const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null)
   const [, setFrameTick] = useState(0)
 
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -941,7 +982,7 @@ export default function LogicSimulator() {
     return () => clearInterval(id)
   }, [simulator])
 
-  /* history helpers */
+  /* history */
   const pushHistory = useCallback(() => {
     setHistory((h) => {
       const entry: HistoryEntry = {
@@ -949,7 +990,7 @@ export default function LogicSimulator() {
         wires: live.current.wires.map((w) => ({ ...w })),
       }
       const next = [...h, entry]
-      return next.length > 60 ? next.slice(-60) : next
+      return next.length > 80 ? next.slice(-80) : next
     })
   }, [])
 
@@ -970,7 +1011,7 @@ export default function LogicSimulator() {
     const c = live.current.camera
     return { x: (sx - c.offsetX) / c.zoom, y: (sy - c.offsetY) / c.zoom }
   }
-  const posFromEvent = (e: React.PointerEvent) => {
+  const posFromEvent = (e: React.PointerEvent | React.MouseEvent) => {
     const r = canvasRect()
     return screenToWorld(e.clientX - r.left, e.clientY - r.top)
   }
@@ -1022,7 +1063,6 @@ export default function LogicSimulator() {
     return best
   }
 
-  // Place centred under cursor
   const place = (p: Vec2) => {
     if (!placement) return
     pushHistory()
@@ -1043,6 +1083,7 @@ export default function LogicSimulator() {
 
   /* pointer handlers */
   const onPointerDown = (e: React.PointerEvent) => {
+    setCtxMenu(null)
     const r = canvasRect()
     const sx = e.clientX - r.left
     const sy = e.clientY - r.top
@@ -1114,10 +1155,9 @@ export default function LogicSimulator() {
 
       const node = findNodeAt(p)
       if (node) {
-        // INPUT toggle hit
         if (node.kind === 'INPUT') {
-          const btnW = 42
-          const btnH = 22
+          const btnW = 44
+          const btnH = 24
           const bx = node.position.x + NODE_W - btnW - 12
           const by = node.position.y + (nodeHeight(node) - btnH) / 2
           if (p.x >= bx && p.x <= bx + btnW && p.y >= by && p.y <= by + btnH) {
@@ -1220,7 +1260,6 @@ export default function LogicSimulator() {
         pending.current = { start: d.start, startPos: d.startPos }
       }
     } else if (d?.kind === 'move') {
-      // snap positions on drop
       const idSet = new Set(d.ids)
       setNodes((ns) =>
         ns.map((n) =>
@@ -1258,25 +1297,29 @@ export default function LogicSimulator() {
     )
   }
 
-  /* copy / paste */
+  /* copy / cut / paste */
   const copySelection = () => {
     if (selected.size === 0) return
     const ids = new Set(selected)
-    const selNodes = nodes.filter((n) => ids.has(n.id)).map((n) => ({
-      ...n,
-      position: { ...n.position },
-    }))
+    const selNodes = nodes
+      .filter((n) => ids.has(n.id))
+      .map((n) => ({ ...n, position: { ...n.position } }))
     const selWires = wires.filter(
       (w) => ids.has(w.from.nodeId) && ids.has(w.to.nodeId),
     )
     setClipboard({ nodes: selNodes, wires: selWires })
   }
 
+  const cutSelection = () => {
+    copySelection()
+    deleteSelection()
+  }
+
   const pasteClipboard = () => {
     if (!clipboard || clipboard.nodes.length === 0) return
     pushHistory()
     const idMap = new Map<string, string>()
-    const offset = 40
+    const offset = 48
     const newNodes = clipboard.nodes.map((n) => {
       const newId = uid(n.kind.toLowerCase())
       idMap.set(n.id, newId)
@@ -1288,14 +1331,8 @@ export default function LogicSimulator() {
     })
     const newWires = clipboard.wires.map((w) => ({
       id: uid('w'),
-      from: {
-        ...w.from,
-        nodeId: idMap.get(w.from.nodeId)!,
-      },
-      to: {
-        ...w.to,
-        nodeId: idMap.get(w.to.nodeId)!,
-      },
+      from: { ...w.from, nodeId: idMap.get(w.from.nodeId)! },
+      to: { ...w.to, nodeId: idMap.get(w.to.nodeId)! },
     }))
     setNodes((ns) => [...ns, ...newNodes])
     setWires((ws) => [...ws, ...newWires])
@@ -1307,6 +1344,7 @@ export default function LogicSimulator() {
     if (selected.size === 0) return
     setChipName('My Chip')
     setChipColor(CHIP_ACCENTS[Math.floor(Math.random() * CHIP_ACCENTS.length)])
+    setChipTint(CHIP_TINTS[Math.floor(Math.random() * CHIP_TINTS.length)])
     setCreateModal(true)
   }
 
@@ -1314,6 +1352,7 @@ export default function LogicSimulator() {
     const def = packageSelectionInto(
       chipName.trim() || 'My Chip',
       chipColor,
+      chipTint,
       live.current.nodes,
       live.current.wires,
       live.current.selected,
@@ -1339,6 +1378,7 @@ export default function LogicSimulator() {
     if (editing) return
     const chip = chipsById[chipId]
     if (!chip || chip.builtin) return
+    setCtxMenu(null)
     setEditing({
       chipId,
       snapNodes: live.current.nodes,
@@ -1360,12 +1400,8 @@ export default function LogicSimulator() {
       if (save) {
         const curNodes = live.current.nodes
         const curWires = live.current.wires
-        const inputs = curNodes
-          .filter((n) => n.kind === 'INPUT')
-          .sort((a, b) => a.position.y - b.position.y)
-        const outputs = curNodes
-          .filter((n) => n.kind === 'OUTPUT')
-          .sort((a, b) => a.position.y - b.position.y)
+        const inputs = curNodes.filter((n) => n.kind === 'INPUT').sort((a, b) => a.position.y - b.position.y)
+        const outputs = curNodes.filter((n) => n.kind === 'OUTPUT').sort((a, b) => a.position.y - b.position.y)
         if (inputs.length === 0 || outputs.length === 0) {
           window.alert('A chip needs at least one INPUT and one OUTPUT.')
           return session
@@ -1391,10 +1427,8 @@ export default function LogicSimulator() {
           refreshed.filter((n) => n.chipId === session.chipId).map((n) => n.id),
         )
         const refreshedWires = session.snapWires.filter((w) => {
-          const fromStale =
-            refreshedIds.has(w.from.nodeId) && !validOut.has(w.from.pinId)
-          const toStale =
-            refreshedIds.has(w.to.nodeId) && !validIn.has(w.to.pinId)
+          const fromStale = refreshedIds.has(w.from.nodeId) && !validOut.has(w.from.pinId)
+          const toStale = refreshedIds.has(w.to.nodeId) && !validIn.has(w.to.pinId)
           return !fromStale && !toStale
         })
         setNodes(refreshed)
@@ -1414,8 +1448,7 @@ export default function LogicSimulator() {
   const deleteCustomChip = (chipId: string) => {
     const chip = chipsById[chipId]
     if (!chip || chip.builtin) return
-    if (!window.confirm(`Delete “${chip.name}”? All instances will be removed.`))
-      return
+    if (!window.confirm(`Delete “${chip.name}”? All instances will be removed.`)) return
     pushHistory()
     const remove = new Set(
       live.current.nodes.filter((n) => n.chipId === chipId).map((n) => n.id),
@@ -1430,8 +1463,7 @@ export default function LogicSimulator() {
       remove.forEach((id) => next.delete(id))
       return next
     })
-    if (placement?.type === 'CHIP' && placement.chipId === chipId)
-      setPlacement(null)
+    if (placement?.type === 'CHIP' && placement.chipId === chipId) setPlacement(null)
   }
 
   const onDoubleClick = (e: React.MouseEvent) => {
@@ -1439,24 +1471,65 @@ export default function LogicSimulator() {
     const r = canvasRect()
     const p = screenToWorld(e.clientX - r.left, e.clientY - r.top)
     const node = findNodeAt(p)
-    if (
-      node?.kind === 'CHIP' &&
-      node.chipId &&
-      !chipsById[node.chipId]?.builtin
-    ) {
+    if (node?.kind === 'CHIP' && node.chipId && !chipsById[node.chipId]?.builtin) {
       enterEditChip(node.chipId)
     }
   }
 
-  const onContextMenu = (e: React.PointerEvent) => {
+  /* custom context menu */
+  const onContextMenu = (e: React.MouseEvent) => {
     e.preventDefault()
-    const p = posFromEvent(e)
-    const hw = findHoveredWire(p)
-    if (hw) {
-      pushHistory()
-      setWires((ws) => ws.filter((w) => w.id !== hw))
-    } else if (selected.size > 0) {
-      deleteSelection()
+    const r = canvasRect()
+    const p = screenToWorld(e.clientX - r.left, e.clientY - r.top)
+    const node = findNodeAt(p)
+    const wireId = findHoveredWire(p)
+
+    let target: ContextMenuState['target'] = 'canvas'
+    let nodeId: string | undefined
+    let wId: string | undefined
+
+    if (node) {
+      target = node.kind === 'CHIP' && node.chipId && !chipsById[node.chipId]?.builtin
+        ? 'chip'
+        : 'node'
+      nodeId = node.id
+      if (!selected.has(node.id)) setSelected(new Set([node.id]))
+    } else if (wireId) {
+      target = 'wire'
+      wId = wireId
+    }
+
+    setCtxMenu({
+      x: e.clientX,
+      y: e.clientY,
+      world: p,
+      target,
+      nodeId,
+      wireId: wId,
+    })
+  }
+
+  const ctxAction = (action: string) => {
+    if (!ctxMenu) return
+    setCtxMenu(null)
+    switch (action) {
+      case 'cut': cutSelection(); break
+      case 'copy': copySelection(); break
+      case 'paste': pasteClipboard(); break
+      case 'delete':
+        if (ctxMenu.wireId) {
+          pushHistory()
+          setWires((ws) => ws.filter((w) => w.id !== ctxMenu.wireId))
+        } else {
+          deleteSelection()
+        }
+        break
+      case 'edit':
+        if (ctxMenu.nodeId) {
+          const n = nodes.find((x) => x.id === ctxMenu.nodeId)
+          if (n?.chipId) enterEditChip(n.chipId)
+        }
+        break
     }
   }
 
@@ -1477,15 +1550,13 @@ export default function LogicSimulator() {
   /* export / import */
   const exportJSON = () => {
     const data = {
-      version: 1,
+      version: 2,
       nodes,
       wires,
       chips: chips.filter((c) => !c.builtin),
       camera,
     }
-    const blob = new Blob([JSON.stringify(data, null, 2)], {
-      type: 'application/json',
-    })
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
@@ -1524,14 +1595,11 @@ export default function LogicSimulator() {
   /* keyboard */
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
-      // never steal keys while typing in modal / inputs
       if (
         modalOpen.current ||
         (e.target as HTMLElement)?.tagName === 'INPUT' ||
         (e.target as HTMLElement)?.tagName === 'TEXTAREA'
-      ) {
-        return
-      }
+      ) return
 
       if (e.code === 'Space') {
         if (!spaceDown.current) {
@@ -1545,26 +1613,16 @@ export default function LogicSimulator() {
 
       const mod = e.metaKey || e.ctrlKey
 
-      if (mod && e.key === 'z') {
-        e.preventDefault()
-        undo()
-        return
-      }
-      if (mod && e.key === 'c') {
-        e.preventDefault()
-        copySelection()
-        return
-      }
-      if (mod && e.key === 'v') {
-        e.preventDefault()
-        pasteClipboard()
-        return
-      }
+      if (mod && e.key === 'z') { e.preventDefault(); undo(); return }
+      if (mod && e.key === 'c') { e.preventDefault(); copySelection(); return }
+      if (mod && e.key === 'v') { e.preventDefault(); pasteClipboard(); return }
+      if (mod && e.key === 'x') { e.preventDefault(); cutSelection(); return }
 
       if (e.key === 'Escape') {
         pending.current = null
         setPlacement(null)
         setCreateModal(false)
+        setCtxMenu(null)
       }
       if ((e.key === 'Delete' || e.key === 'Backspace') && live.current.selected.size > 0) {
         e.preventDefault()
@@ -1657,8 +1715,8 @@ export default function LogicSimulator() {
         }
       }
 
-      const chipColour: Record<string, string> = {}
-      for (const c of s.chips) chipColour[c.id] = c.color
+      const chipMeta: Record<string, { color: string; bgTint?: string }> = {}
+      for (const c of s.chips) chipMeta[c.id] = { color: c.color, bgTint: c.bgTint }
 
       const placing = s.placement
         ? {
@@ -1670,27 +1728,16 @@ export default function LogicSimulator() {
               : s.placement.kind,
           colour:
             s.placement.type === 'CHIP'
-              ? s.chips.find((c) => c.id === s.placement!.chipId)?.color ??
-              '#2563eb'
+              ? s.chips.find((c) => c.id === s.placement!.chipId)?.color ?? '#2563eb'
               : '#1e293b',
         }
         : null
 
       drawScene(
-        ctx,
-        cw,
-        ch,
-        dpr,
-        s.camera,
-        s.nodes,
-        s.wires,
-        signal.current,
-        s.selected,
-        hoverWire.current,
-        chipColour,
-        pnd,
-        box,
-        placing,
+        ctx, cw, ch, dpr,
+        s.camera, s.nodes, s.wires,
+        signal.current, s.selected, hoverWire.current,
+        chipMeta, pnd, box, placing,
       )
     }
     loop()
@@ -1700,8 +1747,7 @@ export default function LogicSimulator() {
   /* UI */
   const btn =
     'inline-flex flex-col items-center gap-0.5 rounded-md px-2.5 py-1.5 text-[11px] font-medium transition select-none'
-  const active =
-    'bg-blue-100 text-blue-700 ring-1 ring-blue-400/60'
+  const active = 'bg-blue-100 text-blue-700 ring-1 ring-blue-400/60'
   const idle = 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
   const isPrim = (k: PrimitiveType) =>
     placement?.type === 'PRIMITIVE' && placement.kind === k
@@ -1829,135 +1875,179 @@ export default function LogicSimulator() {
             ? 'Click to place · Esc to cancel'
             : pending.current
               ? 'Click an input pin to finish the wire'
-              : 'Scroll = zoom · Space/middle-drag = pan · Drag output pin = wire · ⌘/Ctrl+Z = undo · ⌘/Ctrl+C/V = copy/paste'}
+              : 'Scroll = zoom · Space/middle-drag = pan · Right-click = menu · ⌘/Ctrl+Z/C/V/X'}
         </div>
       </main>
 
-      {/* Bottom palette */}
-      {!editingChip && (
-        <footer className="z-20 flex shrink-0 items-stretch gap-4 overflow-x-auto border-t border-slate-200 bg-white px-3 py-2 shadow-[0_-1px_3px_rgba(0,0,0,0.04)]">
-          {/* I/O */}
-          <section className="flex flex-col">
-            <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-              I/O
-            </h3>
-            <div className="flex gap-1.5">
-              {(['INPUT', 'OUTPUT'] as PrimitiveType[]).map((k) => (
-                <button
-                  key={k}
-                  onClick={() => setPlacement({ type: 'PRIMITIVE', kind: k })}
-                  className={`${btn} ${isPrim(k) ? active : idle}`}
+      {/* Bottom palette – stays visible even in edit mode so you can add/remove gates */}
+      <footer className="z-20 flex shrink-0 items-stretch gap-4 overflow-x-auto border-t border-slate-200 bg-white px-3 py-2 shadow-[0_-1px_3px_rgba(0,0,0,0.04)]">
+        <section className="flex flex-col">
+          <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+            I/O
+          </h3>
+          <div className="flex gap-1.5">
+            {(['INPUT', 'OUTPUT'] as PrimitiveType[]).map((k) => (
+              <button
+                key={k}
+                onClick={() => setPlacement({ type: 'PRIMITIVE', kind: k })}
+                className={`${btn} ${isPrim(k) ? active : idle}`}
+              >
+                <span className="grid h-7 w-7 place-items-center rounded bg-slate-100 font-mono text-xs font-bold text-slate-700 ring-1 ring-slate-200">
+                  {k === 'INPUT' ? 'I' : 'O'}
+                </span>
+                {k === 'INPUT' ? 'Toggle' : 'LED'}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <div className="my-1 w-px bg-slate-200" />
+
+        <section className="flex flex-col">
+          <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+            Gates
+          </h3>
+          <div className="flex gap-1.5">
+            {(['AND', 'OR', 'NOT'] as PrimitiveType[]).map((k) => (
+              <button
+                key={k}
+                onClick={() => setPlacement({ type: 'PRIMITIVE', kind: k })}
+                className={`${btn} ${isPrim(k) ? active : idle}`}
+              >
+                <span className="grid h-7 w-7 place-items-center rounded bg-slate-100 font-mono text-sm font-bold text-slate-700 ring-1 ring-slate-200">
+                  {k === 'AND' ? '∧' : k === 'OR' ? '∨' : '¬'}
+                </span>
+                {k}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <div className="my-1 w-px bg-slate-200" />
+
+        <section className="flex flex-col">
+          <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+            Flip-Flops
+          </h3>
+          <div className="flex gap-1.5">
+            {builtinChips.map((c) => (
+              <button
+                key={c.id}
+                onClick={() => setPlacement({ type: 'CHIP', chipId: c.id })}
+                className={`${btn} ${isChip(c.id) ? active : idle}`}
+              >
+                <span
+                  className="grid h-7 min-w-7 place-items-center rounded bg-slate-100 px-1 font-mono text-xs font-bold ring-1"
+                  style={{ color: c.color, borderColor: `${c.color}55` }}
                 >
-                  <span className="grid h-7 w-7 place-items-center rounded bg-slate-100 font-mono text-xs font-bold text-slate-700 ring-1 ring-slate-200">
-                    {k === 'INPUT' ? 'I' : 'O'}
-                  </span>
-                  {k === 'INPUT' ? 'Toggle' : 'LED'}
-                </button>
-              ))}
-            </div>
-          </section>
+                  {c.name.slice(0, 2).toUpperCase()}
+                </span>
+                <span className="max-w-20 truncate">{c.name}</span>
+              </button>
+            ))}
+          </div>
+        </section>
 
-          <div className="my-1 w-px bg-slate-200" />
-
-          {/* Gates */}
-          <section className="flex flex-col">
-            <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-              Gates
-            </h3>
-            <div className="flex gap-1.5">
-              {(['AND', 'OR', 'NOT'] as PrimitiveType[]).map((k) => (
-                <button
-                  key={k}
-                  onClick={() => setPlacement({ type: 'PRIMITIVE', kind: k })}
-                  className={`${btn} ${isPrim(k) ? active : idle}`}
-                >
-                  <span className="grid h-7 w-7 place-items-center rounded bg-slate-100 font-mono text-sm font-bold text-slate-700 ring-1 ring-slate-200">
-                    {k === 'AND' ? '∧' : k === 'OR' ? '∨' : '¬'}
-                  </span>
-                  {k}
-                </button>
-              ))}
-            </div>
-          </section>
-
-          <div className="my-1 w-px bg-slate-200" />
-
-          {/* Flip-flops */}
-          <section className="flex flex-col">
-            <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-              Flip-Flops
-            </h3>
-            <div className="flex gap-1.5">
-              {builtinChips.map((c) => (
-                <button
-                  key={c.id}
-                  onClick={() => setPlacement({ type: 'CHIP', chipId: c.id })}
-                  className={`${btn} ${isChip(c.id) ? active : idle}`}
-                >
-                  <span
-                    className="grid h-7 min-w-7 place-items-center rounded bg-slate-100 px-1 font-mono text-xs font-bold ring-1"
-                    style={{ color: c.color, borderColor: `${c.color}55` }}
-                  >
-                    {c.name.slice(0, 2).toUpperCase()}
-                  </span>
-                  <span className="max-w-20 truncate">{c.name}</span>
-                </button>
-              ))}
-            </div>
-          </section>
-
-          {/* Custom */}
-          {customChips.length > 0 && (
-            <>
-              <div className="my-1 w-px bg-slate-200" />
-              <section className="flex min-w-0 flex-col">
-                <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-                  Custom
-                </h3>
-                <div className="flex gap-1.5 overflow-x-auto">
-                  {customChips.map((c) => (
-                    <div key={c.id} className="group relative flex flex-col items-center">
-                      <button
-                        onClick={() => setPlacement({ type: 'CHIP', chipId: c.id })}
-                        className={`${btn} ${isChip(c.id) ? active : idle}`}
+        {customChips.length > 0 && (
+          <>
+            <div className="my-1 w-px bg-slate-200" />
+            <section className="flex min-w-0 flex-col">
+              <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                Custom
+              </h3>
+              <div className="flex gap-1.5 overflow-x-auto">
+                {customChips.map((c) => (
+                  <div key={c.id} className="group relative flex flex-col items-center">
+                    <button
+                      onClick={() => setPlacement({ type: 'CHIP', chipId: c.id })}
+                      className={`${btn} ${isChip(c.id) ? active : idle}`}
+                    >
+                      <span
+                        className="grid h-7 min-w-7 place-items-center rounded bg-slate-100 px-1 font-mono text-xs font-bold ring-1"
+                        style={{ color: c.color, borderColor: `${c.color}55` }}
                       >
-                        <span
-                          className="grid h-7 min-w-7 place-items-center rounded bg-slate-100 px-1 font-mono text-xs font-bold ring-1"
-                          style={{ color: c.color, borderColor: `${c.color}55` }}
-                        >
-                          {c.name.slice(0, 2).toUpperCase()}
-                        </span>
-                        <span className="max-w-20 truncate">{c.name}</span>
+                        {c.name.slice(0, 2).toUpperCase()}
+                      </span>
+                      <span className="max-w-20 truncate">{c.name}</span>
+                    </button>
+                    <div className="absolute -top-1 right-0 hidden gap-0.5 group-hover:flex">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          enterEditChip(c.id)
+                        }}
+                        className="rounded bg-white px-1 text-[9px] text-slate-500 shadow ring-1 ring-slate-200 hover:text-slate-800"
+                        title="Edit"
+                      >
+                        ✎
                       </button>
-                      <div className="absolute -top-1 right-0 hidden gap-0.5 group-hover:flex">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            enterEditChip(c.id)
-                          }}
-                          className="rounded bg-white px-1 text-[9px] text-slate-500 shadow ring-1 ring-slate-200 hover:text-slate-800"
-                          title="Edit"
-                        >
-                          ✎
-                        </button>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            deleteCustomChip(c.id)
-                          }}
-                          className="rounded bg-white px-1 text-[9px] text-red-500 shadow ring-1 ring-slate-200 hover:text-red-600"
-                          title="Delete"
-                        >
-                          ✕
-                        </button>
-                      </div>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          deleteCustomChip(c.id)
+                        }}
+                        className="rounded bg-white px-1 text-[9px] text-red-500 shadow ring-1 ring-slate-200 hover:text-red-600"
+                        title="Delete"
+                      >
+                        ✕
+                      </button>
                     </div>
-                  ))}
-                </div>
-              </section>
+                  </div>
+                ))}
+              </div>
+            </section>
+          </>
+        )}
+      </footer>
+
+      {/* Context menu */}
+      {ctxMenu && (
+        <div
+          className="fixed z-50 min-w-[180px] overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-xl"
+          style={{ left: ctxMenu.x, top: ctxMenu.y }}
+          onMouseLeave={() => setCtxMenu(null)}
+        >
+          <button
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-slate-700 hover:bg-slate-50"
+            onClick={() => ctxAction('cut')}
+          >
+            <Scissors size={14} /> Cut
+            <span className="ml-auto text-[10px] text-slate-400">Ctrl+X</span>
+          </button>
+          <button
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-slate-700 hover:bg-slate-50"
+            onClick={() => ctxAction('copy')}
+          >
+            <Copy size={14} /> Copy
+            <span className="ml-auto text-[10px] text-slate-400">Ctrl+C</span>
+          </button>
+          <button
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-slate-700 hover:bg-slate-50"
+            onClick={() => ctxAction('paste')}
+          >
+            <ClipboardPaste size={14} /> Paste
+            <span className="ml-auto text-[10px] text-slate-400">Ctrl+V</span>
+          </button>
+          <div className="my-1 border-t border-slate-100" />
+          <button
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-red-600 hover:bg-red-50"
+            onClick={() => ctxAction('delete')}
+          >
+            <Trash2 size={14} /> Delete
+            <span className="ml-auto text-[10px] text-slate-400">Del</span>
+          </button>
+          {ctxMenu.target === 'chip' && (
+            <>
+              <div className="my-1 border-t border-slate-100" />
+              <button
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-slate-700 hover:bg-slate-50"
+                onClick={() => ctxAction('edit')}
+              >
+                <Pencil size={14} /> Edit Chip Definition
+              </button>
             </>
           )}
-        </footer>
+        </div>
       )}
 
       {/* Create-chip modal */}
@@ -1983,12 +2073,26 @@ export default function LogicSimulator() {
             <label className="mb-1.5 block text-[11px] font-medium text-slate-500">
               Accent colour
             </label>
-            <div className="mb-5 flex flex-wrap gap-2">
+            <div className="mb-3 flex flex-wrap gap-2">
               {CHIP_ACCENTS.map((c) => (
                 <button
                   key={c}
                   onClick={() => setChipColor(c)}
                   className={`h-7 w-7 rounded-full ring-2 transition ${chipColor === c ? 'ring-slate-800 ring-offset-1' : 'ring-transparent'
+                    }`}
+                  style={{ background: c }}
+                />
+              ))}
+            </div>
+            <label className="mb-1.5 block text-[11px] font-medium text-slate-500">
+              Background tint
+            </label>
+            <div className="mb-5 flex flex-wrap gap-2">
+              {CHIP_TINTS.map((c) => (
+                <button
+                  key={c}
+                  onClick={() => setChipTint(c)}
+                  className={`h-7 w-7 rounded-full border border-slate-200 ring-2 transition ${chipTint === c ? 'ring-slate-800 ring-offset-1' : 'ring-transparent'
                     }`}
                   style={{ background: c }}
                 />
