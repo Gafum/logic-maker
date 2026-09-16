@@ -24,8 +24,7 @@ import {
   RotateCw,
   Crosshair,
   FileText,
-  Link2,
-  MousePointer2,
+  Layers,
 } from 'lucide-react'
 
 /* =====================================================================
@@ -109,9 +108,9 @@ const isPinRefEqual = (a: PinRef, b: PinRef) =>
 
 /* Geometry */
 const GRID = 24
-const NODE_W_MIN = 110
+const NODE_W_MIN = 80
 const NODE_PAD = 14
-const PIN_SPACING = 26
+const PIN_SPACING = 22
 const PIN_R = 5.5
 const MIN_ZOOM = 0.05
 const MAX_ZOOM = 4
@@ -124,47 +123,69 @@ const snap = (v: number) => Math.round(v / GRID) * GRID
 
 /** Approximate text width for dynamic node sizing (UI font ~12px medium) */
 function approxLabelWidth(label: string): number {
-  // rough avg char width for ui-sans-serif 12px bold/medium
-  return Math.ceil(label.length * 7.2) + 28
+  // rough avg char width for ui-sans-serif 12px medium, tight padding — size follows the label only
+  return Math.ceil(label.length * 5) + 40
 }
 
 const nodeRows = (n: CircuitNode) => Math.max(n.inputs.length, n.outputs.length, 1)
 const nodeHeight = (n: CircuitNode) =>
   NODE_PAD * 2 + PIN_SPACING * Math.max(nodeRows(n) - 1, 0) + PIN_SPACING
 const nodeWidth = (n: CircuitNode) => {
-  const base = NODE_W_MIN
   const fromLabel = approxLabelWidth(n.label)
-  // chips / gates may have long pin names too
+  // chips may have long pin names
   let pinExtra = 0
   if (n.kind === 'CHIP') {
-    const longest = Math.max(
-      0,
-      ...n.inputs.map((p) => p.name.length),
-      ...n.outputs.map((p) => p.name.length),
-    )
-    pinExtra = Math.max(0, longest * 6 - 20)
+    const longest = Math.max(2, ...n.inputs.map((p) => p.name.length),)
+      + Math.max(
+        2, ...n.outputs.map((p) => p.name.length),
+      )
+    pinExtra = Math.max(0, longest * 7.6)
   }
-  return Math.max(base, fromLabel, NODE_W_MIN + pinExtra)
+  // INPUT / BUTTON / CLOCK need room for the toggle/status button on the right
+  const btnReserve =
+    n.kind === 'INPUT' || n.kind === 'BUTTON' || n.kind === 'CLOCK' ? 60 : 0
+  // OUTPUT needs room for the lightbulb indicator
+  const outReserve = n.kind === 'OUTPUT' ? 28 : 0
+  return Math.max(NODE_W_MIN, fromLabel + btnReserve + outReserve + pinExtra)
 }
 const nodeBox = (n: CircuitNode) => ({
   x: n.position.x, y: n.position.y, w: nodeWidth(n), h: nodeHeight(n),
 })
-/** Evenly distribute pins across full node height; a single pin is centered. */
-function pinY(n: CircuitNode, index: number, count: number): number {
-  const h = nodeHeight(n)
-  if (count <= 1) return n.position.y + h / 2
-  const top = n.position.y + NODE_PAD + PIN_SPACING / 2
-  const bot = n.position.y + h - NODE_PAD - PIN_SPACING / 2
-  return top + ((bot - top) * index) / (count - 1)
+
+/**
+ * Pin position on a node's edge, aware of rotation.
+ * Rotation only changes WHICH edge a logical side (in/out) is drawn on —
+ * the node body itself stays axis-aligned (simple & robust):
+ *   0°   in=left,   out=right
+ *   90°  in=top,    out=bottom
+ *   180° in=right,  out=left
+ *   270° in=bottom, out=top
+ */
+function pinPos(n: CircuitNode, side: PinSide, index: number, count: number): Vec2 {
+  const b = nodeBox(n)
+  const rot = n.rotation || 0
+  let edge: 'left' | 'right' | 'top' | 'bottom'
+  if (rot === 90) edge = side === 'in' ? 'top' : 'bottom'
+  else if (rot === 180) edge = side === 'in' ? 'right' : 'left'
+  else if (rot === 270) edge = side === 'in' ? 'bottom' : 'top'
+  else edge = side === 'in' ? 'left' : 'right'
+
+  if (edge === 'left' || edge === 'right') {
+    const x = edge === 'left' ? b.x : b.x + b.w
+    const y = count <= 1
+      ? b.y + b.h / 2
+      : b.y + NODE_PAD + PIN_SPACING / 2 + ((b.h - NODE_PAD * 2 - PIN_SPACING) * index) / (count - 1)
+    return { x, y }
+  }
+  const y = edge === 'top' ? b.y : b.y + b.h
+  const x = count <= 1
+    ? b.x + b.w / 2
+    : b.x + NODE_PAD + PIN_SPACING / 2 + ((b.w - NODE_PAD * 2 - PIN_SPACING) * index) / (count - 1)
+  return { x, y }
 }
-const leftPinPos = (n: CircuitNode, i: number): Vec2 => ({
-  x: n.position.x,
-  y: pinY(n, i, n.inputs.length),
-})
-const rightPinPos = (n: CircuitNode, i: number): Vec2 => ({
-  x: n.position.x + nodeWidth(n),
-  y: pinY(n, i, n.outputs.length),
-})
+/** Kept for call-site compatibility: "left" = input pin i, "right" = output pin i (edge decided by rotation) */
+const leftPinPos = (n: CircuitNode, i: number): Vec2 => pinPos(n, 'in', i, n.inputs.length)
+const rightPinPos = (n: CircuitNode, i: number): Vec2 => pinPos(n, 'out', i, n.outputs.length)
 
 interface EnumeratedPin {
   nodeId: string; pinId: string; side: PinSide; index: number; pos: Vec2; node: CircuitNode
@@ -230,7 +251,8 @@ function shade(hex: string, amount: number) {
 /** solid (non-transparent) fill for a gate/chip body, tuned per theme */
 function solidFill(edgeColor: string | undefined, dark: boolean, fallback: string) {
   if (!edgeColor) return fallback
-  return dark ? shade(edgeColor, -0.72) : shade(edgeColor, 0.86)
+  // Dark mode: keep a bright, clearly visible tint. Light mode: soft pastel.
+  return dark ? shade(edgeColor, -0.32) : shade(edgeColor, 0.86)
 }
 
 const makePins = (names: string[]): Pin[] =>
@@ -569,8 +591,8 @@ const LIGHT: Theme = {
   pinHigh: '#2563eb', pinLow: '#94a3b8', body: '#ffffff', edge: '#1e293b', label: '#0f172a', sel: '#2563eb',
 }
 const DARK: Theme = {
-  bg: '#111111', grid: '#1c1c1c', wireHigh: '#38bdf8', wireLow: '#3f3f46', wireHover: '#52525b',
-  pinHigh: '#38bdf8', pinLow: '#3f3f46', body: '#1a1a1a', edge: '#71717a', label: '#e4e4e7', sel: '#38bdf8',
+  bg: '#0b0b0d', grid: '#2a2a2e', wireHigh: '#38bdf8', wireLow: '#9ca3af', wireHover: '#d1d5db',
+  pinHigh: '#38bdf8', pinLow: '#9ca3af', body: '#3f3f46', edge: '#e4e4e7', label: '#fafafa', sel: '#38bdf8',
 }
 
 /* Renderer */
@@ -685,9 +707,9 @@ function drawNode(
     const nw = nodeWidth(n)
     const bx = n.position.x + nw - btnW - 12
     const by = n.position.y + (b.h - btnH) / 2
-    ctx.fillStyle = value ? theme.wireHigh : (dark ? '#334155' : '#e2e8f0')
+    ctx.fillStyle = value ? theme.wireHigh : (dark ? '#3f3f46' : '#e2e8f0')
     roundRect(ctx, bx, by, btnW, btnH, 6); ctx.fill()
-    ctx.strokeStyle = value ? theme.wireHigh : theme.pinLow; ctx.lineWidth = 1.2; ctx.stroke()
+    ctx.strokeStyle = value ? theme.wireHigh : (dark ? '#a1a1aa' : theme.pinLow); ctx.lineWidth = 1.2; ctx.stroke()
     ctx.fillStyle = value ? '#fff' : theme.label
     ctx.font = '700 10px ui-sans-serif, system-ui, sans-serif'
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
@@ -699,7 +721,13 @@ function drawNode(
     ctx.fillStyle = theme.label
     ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif'
     ctx.textAlign = 'left'
+    // clip label so it never overlaps the status button
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(n.position.x + 8, n.position.y, bx - n.position.x - 10, b.h)
+    ctx.clip()
     ctx.fillText(n.label, n.position.x + 12, n.position.y + b.h / 2)
+    ctx.restore()
     ctx.restore()
     return
   }
@@ -708,7 +736,7 @@ function drawNode(
     drawBody(ctx, n, fill, edge, selected, zoom, theme)
     const value = !!signal[pinKey(n.id, n.inputs[0]?.id ?? 'in')]
     const nw = nodeWidth(n)
-    const cy = leftPinPos(n, 0).y, cx = n.position.x + nw - 28
+    const cy = n.position.y + b.h / 2, cx = n.position.x + nw - 28
     if (value) { ctx.save(); ctx.shadowColor = theme.wireHigh + '80'; ctx.shadowBlur = 14 }
     // Classic lightbulb-style indicator
     ctx.beginPath()
@@ -726,7 +754,12 @@ function drawNode(
     ctx.fillStyle = theme.label
     ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif'
     ctx.textAlign = 'left'; ctx.textBaseline = 'middle'
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(n.position.x + 8, n.position.y, cx - n.position.x - 16, b.h)
+    ctx.clip()
     ctx.fillText(n.label, n.position.x + 12, cy)
+    ctx.restore()
     ctx.restore()
     return
   }
@@ -772,7 +805,7 @@ function drawNode(
 
 function drawPin(ctx: CanvasRenderingContext2D, x: number, y: number, high: boolean, zoom: number, theme: Theme) {
   ctx.beginPath(); ctx.arc(x, y, PIN_R, 0, Math.PI * 2)
-  ctx.fillStyle = high ? theme.pinHigh : (theme.body === '#ffffff' ? '#e2e8f0' : '#334155')
+  ctx.fillStyle = high ? theme.pinHigh : (theme.body === '#ffffff' ? '#e2e8f0' : '#52525b')
   ctx.fill()
   ctx.strokeStyle = high ? theme.pinHigh : theme.pinLow
   ctx.lineWidth = 1.3 / zoom; ctx.stroke()
@@ -838,7 +871,8 @@ function strokeWirePath(ctx: CanvasRenderingContext2D, pts: Vec2[], mode: 'smoot
 function drawScene(
   ctx: CanvasRenderingContext2D, sw: number, sh: number, dpr: number,
   cam: Camera, nodes: CircuitNode[], wires: Wire[], signal: SignalMap,
-  selected: Set<string>, selectedWireId: string | null, hoverWireId: string | null,
+  selected: Set<string>, selectedWireId: string | null, selectedWireIds: Set<string>, hoverWireId: string | null,
+  selectedMids: Set<string>,
   chipMeta: Record<string, { color: string }>,
   pending: { start: PinRef; startPos: Vec2; end: Vec2 } | null,
   box: { x: number; y: number; w: number; h: number } | null,
@@ -864,7 +898,7 @@ function drawScene(
     if (!from || !to) continue
     const vw = wireView(from, to, w)
     if (!vw) continue
-    const high = wireActive(w), hover = hoverWireId === w.id, isSel = selectedWireId === w.id
+    const high = wireActive(w), hover = hoverWireId === w.id, isSel = selectedWireId === w.id || selectedWireIds.has(w.id)
     const pts = vw.pts
     const mode = vw.mode
     if (high) {
@@ -880,14 +914,16 @@ function drawScene(
 
     // control point dots
     if (w.mids) {
-      for (const m of w.mids) {
-        ctx.beginPath(); ctx.arc(m.x, m.y, 4.5 / zoom, 0, Math.PI * 2)
-        ctx.fillStyle = theme.body
+      w.mids.forEach((m, i) => {
+        const midSel = selectedMids.has(`${w.id}:${i}`)
+        const r = (midSel ? 6 : 4.5) / zoom
+        ctx.beginPath(); ctx.arc(m.x, m.y, r, 0, Math.PI * 2)
+        ctx.fillStyle = midSel ? theme.sel : theme.body
         ctx.fill()
         ctx.lineWidth = 1.4 / zoom
-        ctx.strokeStyle = isSel ? theme.sel : theme.wireHover
+        ctx.strokeStyle = midSel ? theme.sel : (isSel ? theme.sel : theme.wireHover)
         ctx.stroke()
-      }
+      })
     }
   }
 
@@ -917,6 +953,44 @@ function drawScene(
   }
 }
 
+/** Rasterize a set of nodes/wires to a PNG data URL — used for documentation & PDF export. */
+function renderNodesToImage(
+  nodes: CircuitNode[], wires: Wire[], chipMeta: Record<string, { color: string }>,
+  theme: Theme, dark: boolean, padding = 60, scale = 2,
+): { dataUrl: string; width: number; height: number } {
+  if (!nodes.length) {
+    const w = 480, h = 240
+    const canvas = document.createElement('canvas')
+    canvas.width = w * scale; canvas.height = h * scale
+    const ctx = canvas.getContext('2d')!
+    ctx.setTransform(scale, 0, 0, scale, 0, 0)
+    ctx.fillStyle = theme.bg; ctx.fillRect(0, 0, w, h)
+    ctx.fillStyle = theme.label
+    ctx.font = '600 16px ui-sans-serif, system-ui, sans-serif'
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+    ctx.fillText('(порожньо)', w / 2, h / 2)
+    return { dataUrl: canvas.toDataURL('image/png'), width: w, height: h }
+  }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+  for (const n of nodes) {
+    const b = nodeBox(n)
+    minX = Math.min(minX, b.x); minY = Math.min(minY, b.y)
+    maxX = Math.max(maxX, b.x + b.w); maxY = Math.max(maxY, b.y + b.h)
+  }
+  const w = (maxX - minX) + padding * 2
+  const h = (maxY - minY) + padding * 2
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.round(w * scale)
+  canvas.height = Math.round(h * scale)
+  const ctx = canvas.getContext('2d')!
+  const cam: Camera = { zoom: 1, offsetX: -minX + padding, offsetY: -minY + padding }
+  drawScene(
+    ctx, w, h, scale, cam, nodes, wires, {}, new Set(), null, new Set(), null, new Set(),
+    chipMeta, null, null, null, theme, dark,
+  )
+  return { dataUrl: canvas.toDataURL('image/png'), width: w, height: h }
+}
+
 /* Persistence */
 const STORAGE_KEY = 'logicmaker.v1'
 interface SavedState {
@@ -936,7 +1010,7 @@ type DragMode =
   | { kind: 'move'; ids: string[]; startWorld: Vec2; origin: Map<string, Vec2> }
   | { kind: 'box'; startX: number; startY: number; endX: number; endY: number }
   | { kind: 'wire'; start: PinRef; startPos: Vec2; end: Vec2 }
-  | { kind: 'wireMid'; wireId: string; midIndex: number }
+  | { kind: 'wireMid'; startWorld: Vec2; origins: Map<string, Vec2> } // key = "wireId:index"
   | null
 
 export default function LogicMaker() {
@@ -946,6 +1020,7 @@ export default function LogicMaker() {
   const [chips, setChips] = useState<ChipDefinition[]>(() => [...makeBuiltInChips(), ...(saved.chips ?? [])])
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [selectedWireId, setSelectedWireId] = useState<string | null>(null)
+  const [selectedWireIds, setSelectedWireIds] = useState<Set<string>>(new Set())
   const [placement, setPlacement] = useState<Placement>(null)
   const [camera, setCamera] = useState<Camera>(saved.camera ?? { zoom: 1, offsetX: 40, offsetY: 40 })
   const [editing, setEditing] = useState<EditSession | null>(null)
@@ -959,9 +1034,10 @@ export default function LogicMaker() {
   const [history, setHistory] = useState<HistoryEntry[]>([])
   const [redoStack, setRedoStack] = useState<HistoryEntry[]>([])
   const [clipboard, setClipboard] = useState<{ nodes: CircuitNode[]; wires: Wire[] } | null>(null)
-  const [wireMode, setWireMode] = useState<'drag' | 'click'>('drag') // drag or click-to-connect
   const [selectedMids, setSelectedMids] = useState<Set<string>>(new Set()) // "wireId:index"
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null)
+  const [paletteCtxMenu, setPaletteCtxMenu] = useState<{ x: number; y: number; placement: Placement } | null>(null)
+  const [explodeView, setExplodeView] = useState<{ title: string; dataUrl: string } | null>(null)
   const [dark, setDark] = useState(saved.dark ?? false)
   const [, setFrameTick] = useState(0)
 
@@ -971,6 +1047,7 @@ export default function LogicMaker() {
   const pan = useRef<{ startScreenX: number; startScreenY: number; startOffsetX: number; startOffsetY: number } | null>(null)
   const spaceDown = useRef(false)
   const pending = useRef<{ start: PinRef; startPos: Vec2 } | null>(null)
+  const pendingDownScreen = useRef<{ x: number; y: number } | null>(null)
   const hoverWire = useRef<string | null>(null)
   const signal = useRef<SignalMap>({})
   const mousePos = useRef<Vec2>({ x: 0, y: 0 })
@@ -978,8 +1055,8 @@ export default function LogicMaker() {
   const modalOpen = useRef(false)
   const buttonHeld = useRef<string | null>(null)
 
-  const live = useRef({ nodes, wires, chips, selected, selectedWireId, placement, camera })
-  useEffect(() => { live.current = { nodes, wires, chips, selected, selectedWireId, placement, camera } })
+  const live = useRef({ nodes, wires, chips, selected, selectedWireId, selectedWireIds, placement, camera, selectedMids })
+  useEffect(() => { live.current = { nodes, wires, chips, selected, selectedWireId, selectedWireIds, placement, camera, selectedMids } })
   useEffect(() => { modalOpen.current = !!(createModal || clockModal || renamePinModal || colorModal) }, [createModal, clockModal, renamePinModal, colorModal])
 
   const simulator = useMemo(() => new Simulator(), [])
@@ -1026,7 +1103,7 @@ export default function LogicMaker() {
         }
         return [...r, cur].slice(-80)
       })
-      setNodes(prev.nodes); setWires(prev.wires); setSelected(new Set()); setSelectedWireId(null); setSelectedMids(new Set())
+      setNodes(prev.nodes); setWires(prev.wires); setSelected(new Set()); setSelectedWireId(null); setSelectedWireIds(new Set()); setSelectedMids(new Set())
       return h.slice(0, -1)
     })
   }, [])
@@ -1042,7 +1119,7 @@ export default function LogicMaker() {
         }
         return [...h, cur].slice(-80)
       })
-      setNodes(next.nodes); setWires(next.wires); setSelected(new Set()); setSelectedWireId(null); setSelectedMids(new Set())
+      setNodes(next.nodes); setWires(next.wires); setSelected(new Set()); setSelectedWireId(null); setSelectedWireIds(new Set()); setSelectedMids(new Set())
       return r.slice(0, -1)
     })
   }, [])
@@ -1074,7 +1151,7 @@ export default function LogicMaker() {
   }
   /** find a draggable mid (control point) near p, on any wire */
   const findMidAt = (p: Vec2): { wireId: string; midIndex: number } | null => {
-    const grab = 9 / live.current.camera.zoom
+    const grab = 12 / live.current.camera.zoom
     for (const w of live.current.wires) {
       if (!w.mids) continue
       for (let i = 0; i < w.mids.length; i++) {
@@ -1151,7 +1228,42 @@ export default function LogicMaker() {
     setNodes((ns) => [...ns, node])
     setSelected(new Set([node.id]))
     setSelectedWireId(null)
+    setSelectedWireIds(new Set())
     setPlacement(null)
+  }
+
+  /** Batch-create N copies of a placement (palette right-click → 2x/4x/8x) stacked near the viewport center. */
+  const batchCreate = (placement: Placement, count: number) => {
+    if (!placement) { setPaletteCtxMenu(null); return }
+    pushHistory()
+    const canvas = canvasRef.current
+    const cw = canvas?.clientWidth ?? 800, ch = canvas?.clientHeight ?? 600
+    const center = screenToWorld(cw / 2, ch / 2)
+    const spacingY = 90
+    const newNodes: CircuitNode[] = []
+    for (let i = 0; i < count; i++) {
+      const ghostH = placement.type === 'PRIMITIVE'
+        ? nodeHeight(createPrimitiveNode(placement.kind, { x: 0, y: 0 }))
+        : 64
+      const pos = {
+        x: snap(center.x - NODE_W_MIN / 2),
+        y: snap(center.y - ((count - 1) * spacingY) / 2 + i * spacingY - ghostH / 2),
+      }
+      let node: CircuitNode
+      if (placement.type === 'CHIP') {
+        const chip = chipsById[placement.chipId]
+        if (!chip) continue
+        node = createChipNode(chip, pos)
+      } else {
+        node = createPrimitiveNode(placement.kind, pos)
+      }
+      newNodes.push(node)
+    }
+    setNodes((ns) => [...ns, ...newNodes])
+    setSelected(new Set(newNodes.map((n) => n.id)))
+    setSelectedWireId(null)
+    setSelectedWireIds(new Set())
+    setPaletteCtxMenu(null)
   }
 
   const onPointerDown = (e: React.PointerEvent) => {
@@ -1187,6 +1299,7 @@ export default function LogicMaker() {
           setNodes((ns) => ns.map((n) => n.id === node.id ? { ...n, value: !n.value } : n))
           setSelected(new Set([node.id]))
           setSelectedWireId(null)
+          setSelectedWireIds(new Set())
           return
         }
       }
@@ -1200,6 +1313,7 @@ export default function LogicMaker() {
           setNodes((ns) => ns.map((n) => n.id === node.id ? { ...n, value: true } : n))
           setSelected(new Set([node.id]))
           setSelectedWireId(null)
+          setSelectedWireIds(new Set())
           return
         }
       }
@@ -1210,26 +1324,24 @@ export default function LogicMaker() {
           setClockModal({ id: node.id, period: node.period ?? 30 })
           setSelected(new Set([node.id]))
           setSelectedWireId(null)
+          setSelectedWireIds(new Set())
           return
         }
       }
       // fall through to pin / move handling below
     }
 
-    // 2) Pins — higher priority than body-drag so wiring still works
-    // Allow starting a wire from ANY pin (in or out). Direction is normalized later.
+    // 2) Pins — higher priority than body-drag so wiring still works.
+    // Auto-detects mode: a quick click starts click-to-connect (waits for a 2nd click);
+    // holding & dragging switches into live drag-to-connect automatically (see onPointerMove).
     const pin = findPinAt(p)
     if (pin) {
-      if (pending.current) {
-        // finish connection (click-to-connect or second click)
+      if (pending.current && !drag.current) {
         const start = pending.current.start
         const end: PinRef = { nodeId: pin.nodeId, pinId: pin.pinId, side: pin.side }
-        // normalize: always store from=out → to=in when possible
         let from = start, to = end
         if (start.side === 'in' && end.side === 'out') {
           from = end; to = start
-        } else if (start.side === end.side) {
-          // same side — still allow but keep order as drawn
         }
         if (!isPinRefEqual(from, to) && from.nodeId !== to.nodeId) {
           pushHistory()
@@ -1237,20 +1349,19 @@ export default function LogicMaker() {
         }
         pending.current = null
         drag.current = null
+        pendingDownScreen.current = null
         return
       }
-      // start new wire
-      if (wireMode === 'click') {
-        pending.current = { start: { nodeId: pin.nodeId, pinId: pin.pinId, side: pin.side }, startPos: pin.pos }
-      } else {
-        drag.current = { kind: 'wire', start: { nodeId: pin.nodeId, pinId: pin.pinId, side: pin.side }, startPos: pin.pos, end: pin.pos }
-      }
+      // start a potential wire — could turn into click-mode or drag-mode
+      pending.current = { start: { nodeId: pin.nodeId, pinId: pin.pinId, side: pin.side }, startPos: pin.pos }
+      pendingDownScreen.current = { x: sx, y: sy }
       return
     }
 
     // cancel pending wire on empty click
     if (pending.current && !pin) {
       pending.current = null
+      pendingDownScreen.current = null
       return
     }
 
@@ -1261,24 +1372,48 @@ export default function LogicMaker() {
       next.add(node.id)
       setSelected(next)
       setSelectedWireId(null)
+      setSelectedWireIds(new Set())
+      setSelectedMids(new Set())
       const origin = new Map<string, Vec2>()
       for (const n of live.current.nodes) if (next.has(n.id)) origin.set(n.id, { ...n.position })
       drag.current = { kind: 'move', ids: Array.from(next), startWorld: p, origin }
       return
     }
 
-    // 3) Control-point drag
+    // 3) Control-point select + drag (supports multi-select via Shift)
     const mid = findMidAt(p)
     if (mid) {
-      drag.current = { kind: 'wireMid', wireId: mid.wireId, midIndex: mid.midIndex }
-      setSelectedWireId(mid.wireId)
+      const key = `${mid.wireId}:${mid.midIndex}`
       setSelected(new Set())
+      setSelectedWireId(null)
+      setSelectedWireIds(new Set())
+      let nextMids: Set<string>
+      if (e.shiftKey) {
+        nextMids = new Set(selectedMids)
+        if (nextMids.has(key)) nextMids.delete(key)
+        else nextMids.add(key)
+      } else if (selectedMids.has(key) && selectedMids.size > 1) {
+        nextMids = selectedMids // keep multi-selection when dragging one of them
+      } else {
+        nextMids = new Set([key])
+      }
+      setSelectedMids(nextMids)
+      // capture origin positions for all selected mids
+      const origins = new Map<string, Vec2>()
+      for (const w of live.current.wires) {
+        if (!w.mids) continue
+        w.mids.forEach((m, i) => {
+          const k = `${w.id}:${i}`
+          if (nextMids.has(k)) origins.set(k, { ...m })
+        })
+      }
+      drag.current = { kind: 'wireMid', startWorld: p, origins }
       return
     }
 
-    // 4) Wire — double-click adds a point ON the segment; single-click selects
+    // 4) Wire — double-click adds a bend point; single-click selects the wire
     const hw = findHoveredWire(p)
-    if (hw && e.detail === 2) {
+    if (hw && e.detail >= 2) {
       pushHistory()
       const byId = new Map(live.current.nodes.map((n) => [n.id, n]))
       setWires((ws) => ws.map((w) => {
@@ -1291,17 +1426,23 @@ export default function LogicMaker() {
         return { ...w, mids, straight: w.straight }
       }))
       setSelectedWireId(hw)
+      setSelectedWireIds(new Set())
       setSelected(new Set())
+      setSelectedMids(new Set())
       return
     }
     if (hw) {
       setSelectedWireId(hw)
+      setSelectedWireIds(new Set())
       setSelected(new Set())
+      setSelectedMids(new Set())
       return
     }
 
     setSelected(new Set())
     setSelectedWireId(null)
+    setSelectedWireIds(new Set())
+    setSelectedMids(new Set())
     drag.current = { kind: 'box', startX: p.x, startY: p.y, endX: p.x, endY: p.y }
   }
 
@@ -1309,26 +1450,43 @@ export default function LogicMaker() {
     const r = canvasRect()
     const sx = e.clientX - r.left, sy = e.clientY - r.top
     if (pan.current) {
+      const p0 = pan.current
       setCamera((c) => ({
         ...c,
-        offsetX: pan.current!.startOffsetX + (sx - pan.current!.startScreenX),
-        offsetY: pan.current!.startOffsetY + (sy - pan.current!.startScreenY),
+        offsetX: p0.startOffsetX + (sx - p0.startScreenX),
+        offsetY: p0.startOffsetY + (sy - p0.startScreenY),
       }))
       return
     }
     const p = screenToWorld(sx, sy)
     mousePos.current = p
+
+    // Auto-detect: turn a held-down pin click into a live wire drag once the pointer
+    // has moved past a small threshold (so a tap still behaves as click-to-connect).
+    if (pending.current && !drag.current && pendingDownScreen.current) {
+      const dx = sx - pendingDownScreen.current.x, dy = sy - pendingDownScreen.current.y
+      if (Math.hypot(dx, dy) > 6) {
+        drag.current = { kind: 'wire', start: pending.current.start, startPos: pending.current.startPos, end: p }
+      }
+    }
+
     if (drag.current?.kind === 'box') { drag.current.endX = p.x; drag.current.endY = p.y }
     else if (drag.current?.kind === 'wire') drag.current.end = p
     else if (drag.current?.kind === 'wireMid') {
       const d = drag.current
-      // Free placement — no magnetic grid on control points
-      const np = { x: p.x, y: p.y }
+      const dx = p.x - d.startWorld.x
+      const dy = p.y - d.startWorld.y
       setWires((ws) => ws.map((w) => {
-        if (w.id !== d.wireId || !w.mids) return w
-        const mids = w.mids.slice()
-        mids[d.midIndex] = np
-        return { ...w, mids }
+        if (!w.mids) return w
+        let changed = false
+        const mids = w.mids.map((m, i) => {
+          const k = `${w.id}:${i}`
+          const origin = d.origins.get(k)
+          if (!origin) return m
+          changed = true
+          return { x: origin.x + dx, y: origin.y + dy }
+        })
+        return changed ? { ...w, mids } : w
       }))
     } else if (drag.current?.kind === 'move') {
       const d = drag.current, dx = p.x - d.startWorld.x, dy = p.y - d.startWorld.y
@@ -1353,6 +1511,26 @@ export default function LogicMaker() {
     }
     const p = posFromEvent(e)
     const d = drag.current
+
+    // Drag-to-connect finished: complete the wire if released on a valid pin.
+    if (d?.kind === 'wire') {
+      const pinHit = findPinAt(p)
+      if (pinHit) {
+        const start = d.start
+        const end: PinRef = { nodeId: pinHit.nodeId, pinId: pinHit.pinId, side: pinHit.side }
+        let from = start, to = end
+        if (start.side === 'in' && end.side === 'out') { from = end; to = start }
+        if (!isPinRefEqual(from, to) && from.nodeId !== to.nodeId) {
+          pushHistory()
+          finishWire(from, to)
+        }
+      }
+      pending.current = null
+      pendingDownScreen.current = null
+      drag.current = null
+      return
+    }
+
     if (d?.kind === 'box') {
       const minX = Math.min(d.startX, d.endX), maxX = Math.max(d.startX, d.endX)
       const minY = Math.min(d.startY, d.endY), maxY = Math.max(d.startY, d.endY)
@@ -1362,25 +1540,30 @@ export default function LogicMaker() {
         if (b.x < maxX && b.x + b.w > minX && b.y < maxY && b.y + b.h > minY) next.add(n.id)
       }
       setSelected(next)
-    } else if (d?.kind === 'wire') {
-      const pin = findPinAt(p)
-      if (pin) {
-        const end: PinRef = { nodeId: pin.nodeId, pinId: pin.pinId, side: pin.side }
-        let from = d.start, to = end
-        if (d.start.side === 'in' && end.side === 'out') {
-          from = end; to = d.start
-        }
-        if (!isPinRefEqual(from, to) && from.nodeId !== to.nodeId) {
-          pushHistory()
-          finishWire(from, to)
-        }
-        pending.current = null
-      } else if (!findNodeAt(p)) {
-        // release on empty → keep as pending for click-to-connect style
-        pending.current = { start: d.start, startPos: d.startPos }
-      } else {
-        pending.current = { start: d.start, startPos: d.startPos }
+      // also select control points inside the box
+      const midKeys = new Set<string>()
+      for (const w of live.current.wires) {
+        if (!w.mids) continue
+        w.mids.forEach((m, i) => {
+          if (m.x >= minX && m.x <= maxX && m.y >= minY && m.y <= maxY) {
+            midKeys.add(`${w.id}:${i}`)
+          }
+        })
       }
+      setSelectedMids(midKeys)
+      // also select whole wires that pass through the box (so they can be deleted directly)
+      const byId = new Map(live.current.nodes.map((n) => [n.id, n]))
+      const wireIds = new Set<string>()
+      for (const w of live.current.wires) {
+        const from = byId.get(w.from.nodeId), to = byId.get(w.to.nodeId)
+        if (!from || !to) continue
+        const vw = wireView(from, to, w)
+        if (!vw) continue
+        const inside = vw.pts.some((pt) => pt.x >= minX && pt.x <= maxX && pt.y >= minY && pt.y <= maxY)
+        if (inside) wireIds.add(w.id)
+      }
+      setSelectedWireIds(wireIds)
+      if (midKeys.size || wireIds.size) setSelectedWireId(null)
     } else if (d?.kind === 'wireMid') {
       pushHistory()
     } else if (d?.kind === 'move') {
@@ -1403,59 +1586,88 @@ export default function LogicMaker() {
   }
 
   const deleteSelection = () => {
-    if (selectedMids.size > 0) {
+    const mids = live.current.selectedMids
+    if (mids.size > 0) {
       pushHistory()
+      // rebuild mids and remap selection keys after removal
       setWires((ws) => ws.map((w) => {
         if (!w.mids) return w
-        const keep = w.mids.filter((_, i) => !selectedMids.has(`${w.id}:${i}`))
+        const keep = w.mids.filter((_, i) => !mids.has(`${w.id}:${i}`))
         return { ...w, mids: keep.length ? keep : undefined }
       }))
       setSelectedMids(new Set())
       return
     }
-    if (selectedWireId) {
+    const boxWires = live.current.selectedWireIds
+    const wireId = live.current.selectedWireId
+    if (wireId || boxWires.size) {
       pushHistory()
-      setWires((ws) => ws.filter((w) => w.id !== selectedWireId))
+      const toDelete = new Set(boxWires)
+      if (wireId) toDelete.add(wireId)
+      setWires((ws) => ws.filter((w) => !toDelete.has(w.id)))
       setSelectedWireId(null)
+      setSelectedWireIds(new Set())
       return
     }
-    if (!selected.size) return
+    const ids = live.current.selected
+    if (!ids.size) return
     pushHistory()
-    const ids = new Set(selected)
     setNodes((ns) => ns.filter((n) => !ids.has(n.id)))
     setWires((ws) => ws.filter((w) => !ids.has(w.from.nodeId) && !ids.has(w.to.nodeId)))
     setSelected(new Set())
   }
 
   const copySelection = () => {
-    if (!selected.size) return
-    const ids = new Set(selected)
+    const ids = live.current.selected
+    if (!ids.size) return
     setClipboard({
-      nodes: nodes.filter((n) => ids.has(n.id)).map((n) => ({ ...n, position: { ...n.position } })),
-      wires: wires.filter((w) => ids.has(w.from.nodeId) && ids.has(w.to.nodeId)),
+      nodes: live.current.nodes.filter((n) => ids.has(n.id)).map((n) => ({
+        ...n,
+        position: { ...n.position },
+        inputs: n.inputs.map((p) => ({ ...p })),
+        outputs: n.outputs.map((p) => ({ ...p })),
+      })),
+      wires: live.current.wires
+        .filter((w) => ids.has(w.from.nodeId) && ids.has(w.to.nodeId))
+        .map((w) => ({
+          ...w,
+          from: { ...w.from },
+          to: { ...w.to },
+          mids: w.mids?.map((m) => ({ ...m })),
+        })),
     })
   }
   const cutSelection = () => { copySelection(); deleteSelection() }
   const pasteClipboard = () => {
-    if (!clipboard?.nodes.length) return
+    const clip = clipboard
+    if (!clip?.nodes.length) return
     pushHistory()
     const idMap = new Map<string, string>()
     const offset = 48
-    const newNodes = clipboard.nodes.map((n) => {
+    const newNodes = clip.nodes.map((n) => {
       const newId = uid(n.kind.toLowerCase())
       idMap.set(n.id, newId)
-      return { ...n, id: newId, position: { x: n.position.x + offset, y: n.position.y + offset } }
+      return {
+        ...n,
+        id: newId,
+        position: { x: n.position.x + offset, y: n.position.y + offset },
+        inputs: n.inputs.map((p) => ({ ...p })),
+        outputs: n.outputs.map((p) => ({ ...p })),
+      }
     })
-    const newWires = clipboard.wires.map((w) => ({
+    const newWires = clip.wires.map((w) => ({
       id: uid('w'),
       from: { ...w.from, nodeId: idMap.get(w.from.nodeId)! },
       to: { ...w.to, nodeId: idMap.get(w.to.nodeId)! },
       mids: w.mids?.map((m) => ({ x: m.x + offset, y: m.y + offset })),
+      straight: w.straight,
     }))
     setNodes((ns) => [...ns, ...newNodes])
     setWires((ws) => [...ws, ...newWires])
     setSelected(new Set(newNodes.map((n) => n.id)))
     setSelectedWireId(null)
+    setSelectedWireIds(new Set())
+    setSelectedMids(new Set())
   }
 
   const openCreateModal = () => {
@@ -1491,7 +1703,7 @@ export default function LogicMaker() {
     const mapped = chip.nodes.map((n) => ({ ...n, position: { ...n.position } }))
     setNodes(mapped)
     setWires(chip.wires.map((w) => ({ ...w })))
-    setSelected(new Set()); setSelectedWireId(null); setPlacement(null); pending.current = null
+    setSelected(new Set()); setSelectedWireId(null); setSelectedWireIds(new Set()); setPlacement(null); pending.current = null
     // Center the chip content in the viewport
     if (mapped.length) {
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
@@ -1566,7 +1778,7 @@ export default function LogicMaker() {
       } else {
         setNodes(session.snapNodes); setWires(session.snapWires)
       }
-      setSelected(session.snapSelected); setSelectedWireId(null); setCamera(session.snapCamera)
+      setSelected(session.snapSelected); setSelectedWireId(null); setSelectedWireIds(new Set()); setCamera(session.snapCamera)
       setPlacement(null); pending.current = null
       return null
     })
@@ -1622,14 +1834,55 @@ export default function LogicMaker() {
     setRenamePinModal(null)
   }
 
+  /** Swap a gate's kind (e.g. AND → OR) in place, dropping wires to pins that no longer exist. */
+  const replaceNodeKind = (nodeId: string, newKind: PrimitiveType) => {
+    pushHistory()
+    const spec = PRIMITIVE_SPEC[newKind]
+    setNodes((ns) => ns.map((n) => {
+      if (n.id !== nodeId) return n
+      return {
+        ...n,
+        kind: newKind,
+        label: spec.label,
+        inputs: makePins(spec.inputs),
+        outputs: makePins(spec.outputs),
+      }
+    }))
+    const validIn = new Set(spec.inputs.map((s) => s.toLowerCase()))
+    const validOut = new Set(spec.outputs.map((s) => s.toLowerCase()))
+    setWires((ws) => ws.filter((w) => {
+      if (w.from.nodeId === nodeId && !validOut.has(w.from.pinId)) return false
+      if (w.to.nodeId === nodeId && !validIn.has(w.to.pinId)) return false
+      return true
+    }))
+  }
+
   const onDoubleClick = (e: React.MouseEvent) => {
     if (placement) return
     const p = screenToWorld(e.clientX - canvasRect().left, e.clientY - canvasRect().top)
-    if (findMidAt(p)) return // handled by pointerdown mid-drag, not a rename target
-    if (findHoveredWire(p)) return // handled in onPointerDown (adds a control point)
+    if (findMidAt(p)) return
+    // Double-click wire → add bend point (primary path; also in pointerdown detail>=2)
+    const hw = findHoveredWire(p)
+    if (hw) {
+      pushHistory()
+      const byId = new Map(live.current.nodes.map((n) => [n.id, n]))
+      setWires((ws) => ws.map((w) => {
+        if (w.id !== hw) return w
+        const from = byId.get(w.from.nodeId), to = byId.get(w.to.nodeId)
+        if (!from || !to) return w
+        const vw = wireView(from, to, w)
+        if (!vw) return w
+        const mids = insertMidAtClick(vw.pts, w.mids, p)
+        return { ...w, mids, straight: w.straight }
+      }))
+      setSelectedWireId(hw)
+      setSelectedWireIds(new Set())
+      setSelected(new Set())
+      setSelectedMids(new Set())
+      return
+    }
     const pin = findPinAt(p)
     if (pin) {
-      // Rename only allowed for INPUT / OUTPUT / BUTTON / CLOCK (their visible labels become pin names when packaged)
       const n = pin.node
       if (n.kind === 'INPUT' || n.kind === 'OUTPUT' || n.kind === 'BUTTON' || n.kind === 'CLOCK') {
         const side = n.kind === 'OUTPUT' ? 'in' : 'out'
@@ -1639,7 +1892,7 @@ export default function LogicMaker() {
           nodeId: n.id,
           pinId: thePin?.id ?? pin.pinId,
           side,
-          name: n.label, // use node label for I/O (what user sees)
+          name: n.label,
         })
       }
       return
@@ -1662,9 +1915,10 @@ export default function LogicMaker() {
       nodeId = node.id
       if (!selected.has(node.id)) setSelected(new Set([node.id]))
       setSelectedWireId(null)
+      setSelectedWireIds(new Set())
     } else if (wireId) {
       target = 'wire'; wId = wireId
-      setSelectedWireId(wireId); setSelected(new Set())
+      setSelectedWireId(wireId); setSelected(new Set()); setSelectedWireIds(new Set())
     }
     setCtxMenu({ x: e.clientX, y: e.clientY, world: p, target, nodeId, wireId: wId })
   }
@@ -1685,6 +1939,17 @@ export default function LogicMaker() {
     } else if (action === 'color' && ctxMenu.nodeId) {
       const n = nodes.find((x) => x.id === ctxMenu.nodeId)
       if (n?.chipId) openColorModal(n.chipId)
+    } else if (action === 'explode' && ctxMenu.nodeId) {
+      const n = nodes.find((x) => x.id === ctxMenu.nodeId)
+      if (n?.chipId) {
+        const chip = chipsById[n.chipId]
+        if (chip) {
+          const chipMetaAll: Record<string, { color: string }> = {}
+          for (const c of chips) chipMetaAll[c.id] = { color: c.color }
+          const img = renderNodesToImage(chip.nodes, chip.wires, chipMetaAll, theme, dark)
+          setExplodeView({ title: chip.name, dataUrl: img.dataUrl })
+        }
+      }
     } else if (action === 'addPoint' && wireId) {
       pushHistory()
       const pt = ctxMenu.world
@@ -1697,12 +1962,9 @@ export default function LogicMaker() {
         if (!vw) return { ...x, mids: [...(x.mids ?? []), pt] }
         return { ...x, mids: insertMidAtClick(vw.pts, x.mids, pt) }
       }))
-    } else if (action === 'straight' && wireId) {
+    } else if (action === 'toggleStraight' && wireId) {
       pushHistory()
-      setWires((ws) => ws.map((w) => w.id === wireId ? { ...w, straight: true } : w))
-    } else if (action === 'smooth' && wireId) {
-      pushHistory()
-      setWires((ws) => ws.map((w) => w.id === wireId ? { ...w, straight: false } : w))
+      setWires((ws) => ws.map((w) => w.id === wireId ? { ...w, straight: !w.straight } : w))
     } else if (action === 'clearMids' && wireId) {
       pushHistory()
       setWires((ws) => ws.map((w) => w.id === wireId ? { ...w, mids: undefined } : w))
@@ -1715,13 +1977,21 @@ export default function LogicMaker() {
       } else if (n.kind === 'OUTPUT') {
         setRenamePinModal({ nodeId: n.id, pinId: n.inputs[0]?.id ?? 'in', side: 'in', name: n.label })
       }
+    } else if (action === 'rotate' && ctxMenu.nodeId) {
+      pushHistory()
+      setNodes((ns) => ns.map((n) => n.id === ctxMenu.nodeId
+        ? { ...n, rotation: (((n.rotation || 0) + 90) % 360) as 0 | 90 | 180 | 270 }
+        : n))
+    } else if (action.startsWith('replace:') && ctxMenu.nodeId) {
+      const kind = action.split(':')[1] as PrimitiveType
+      replaceNodeKind(ctxMenu.nodeId, kind)
     }
   }
 
   const clearAll = () => {
     if (editing) return
     pushHistory()
-    setNodes([]); setWires([]); setSelected(new Set()); setSelectedWireId(null); setPlacement(null)
+    setNodes([]); setWires([]); setSelected(new Set()); setSelectedWireId(null); setSelectedWireIds(new Set()); setPlacement(null)
     pending.current = null; simulator.reset(); signal.current = {}
   }
 
@@ -1744,10 +2014,44 @@ export default function LogicMaker() {
         setChips([...makeBuiltInChips(), ...(data.chips ?? [])])
         if (data.camera) setCamera(data.camera)
         if (typeof data.dark === 'boolean') setDark(data.dark)
-        setSelected(new Set()); setSelectedWireId(null); setPlacement(null); pending.current = null
+        setSelected(new Set()); setSelectedWireId(null); setSelectedWireIds(new Set()); setPlacement(null); pending.current = null
       } catch { window.alert('Invalid file') }
     }
     input.click()
+  }
+
+  /** Export a PDF "documentation" doc: main scheme + one exploded page per custom chip. */
+  const exportPDF = async () => {
+    let jsPDFCtor: any
+    try {
+      const mod: any = await import('jspdf')
+      jsPDFCtor = mod.jsPDF ?? mod.default
+    } catch {
+      window.alert('Для експорту в PDF потрібен пакет "jspdf". Встановіть його: npm install jspdf')
+      return
+    }
+    const chipMetaAll: Record<string, { color: string }> = {}
+    for (const c of chips) chipMetaAll[c.id] = { color: c.color }
+
+    const doc = new jsPDFCtor({ orientation: 'landscape', unit: 'px', format: 'a4' })
+    const pageW = doc.internal.pageSize.getWidth()
+    const pageH = doc.internal.pageSize.getHeight()
+
+    const addImagePage = (title: string, img: { dataUrl: string; width: number; height: number }, first: boolean) => {
+      if (!first) doc.addPage()
+      doc.setFontSize(16)
+      doc.text(title, 24, 28)
+      const maxW = pageW - 48, maxH = pageH - 64
+      const ratio = Math.min(maxW / img.width, maxH / img.height, 1)
+      const w = img.width * ratio, h = img.height * ratio
+      doc.addImage(img.dataUrl, 'PNG', 24, 48, w, h)
+    }
+
+    addImagePage('Головна схема', renderNodesToImage(nodes, wires, chipMetaAll, LIGHT, false), true)
+    for (const chip of chips.filter((c) => !c.builtin)) {
+      addImagePage(`Мікросхема: ${chip.name} (розгорнуто)`, renderNodesToImage(chip.nodes, chip.wires, chipMetaAll, LIGHT, false), false)
+    }
+    doc.save(`logicmaker-doc-${Date.now()}.pdf`)
   }
 
   useEffect(() => {
@@ -1762,17 +2066,19 @@ export default function LogicMaker() {
         e.preventDefault(); return
       }
       const mod = e.ctrlKey || e.metaKey
-      if (mod && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) { e.preventDefault(); undo(); return }
-      if (mod && ((e.key === 'y' || e.key === 'Y') || ((e.key === 'z' || e.key === 'Z') && e.shiftKey))) { e.preventDefault(); redo(); return }
-      if (mod && (e.key === 'c' || e.key === 'C')) { e.preventDefault(); copySelection(); return }
-      if (mod && (e.key === 'v' || e.key === 'V')) { e.preventDefault(); pasteClipboard(); return }
-      if (mod && (e.key === 'x' || e.key === 'X')) { e.preventDefault(); cutSelection(); return }
+      // Use e.code (physical key) instead of e.key so shortcuts keep working
+      // regardless of active keyboard layout (e.g. Ukrainian/Cyrillic layouts).
+      if (mod && e.code === 'KeyZ' && !e.shiftKey) { e.preventDefault(); undo(); return }
+      if (mod && (e.code === 'KeyY' || (e.code === 'KeyZ' && e.shiftKey))) { e.preventDefault(); redo(); return }
+      if (mod && e.code === 'KeyC') { e.preventDefault(); copySelection(); return }
+      if (mod && e.code === 'KeyV') { e.preventDefault(); pasteClipboard(); return }
+      if (mod && e.code === 'KeyX') { e.preventDefault(); cutSelection(); return }
       if (e.key === 'Escape') {
-        pending.current = null; setPlacement(null); setCreateModal(false)
-        setClockModal(null); setRenamePinModal(null); setColorModal(null); setCtxMenu(null)
-        setSelected(new Set()); setSelectedWireId(null); setSelectedMids(new Set())
+        pending.current = null; pendingDownScreen.current = null; setPlacement(null); setCreateModal(false)
+        setClockModal(null); setRenamePinModal(null); setColorModal(null); setCtxMenu(null); setPaletteCtxMenu(null); setExplodeView(null)
+        setSelected(new Set()); setSelectedWireId(null); setSelectedWireIds(new Set()); setSelectedMids(new Set())
       }
-      if ((e.key === 'Delete' || e.key === 'Backspace') && (live.current.selected.size > 0 || live.current.selectedWireId || selectedMids.size > 0)) {
+      if ((e.key === 'Delete' || e.key === 'Backspace') && (live.current.selected.size > 0 || live.current.selectedWireId || live.current.selectedWireIds.size > 0 || live.current.selectedMids.size > 0)) {
         e.preventDefault(); deleteSelection()
       }
     }
@@ -1855,7 +2161,7 @@ export default function LogicMaker() {
       }
 
       drawScene(ctx, cw, ch, dpr, s.camera, s.nodes, s.wires, signal.current,
-        s.selected, s.selectedWireId, hoverWire.current, chipMeta, pnd, box, placingNode, theme, dark)
+        s.selected, s.selectedWireId, s.selectedWireIds, hoverWire.current, s.selectedMids, chipMeta, pnd, box, placingNode, theme, dark)
     }
     loop()
     return () => cancelAnimationFrame(raf)
@@ -1869,6 +2175,7 @@ export default function LogicMaker() {
   const builtinChips = chips.filter((c) => c.builtin)
   const customChips = chips.filter((c) => !c.builtin)
   const editingChip = editing ? chipsById[editing.chipId] : null
+  const menuItemCls = `flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ${dark ? 'text-slate-200 hover:bg-slate-700' : 'text-slate-700 hover:bg-slate-50'}`
 
   return (
     <div className={`flex h-screen w-screen flex-col overflow-hidden ${dark ? 'bg-slate-900 text-slate-100' : 'bg-slate-100 text-slate-800'}`}>
@@ -1915,20 +2222,20 @@ export default function LogicMaker() {
               Create Chip
             </button>
             <div className={`mx-1 h-5 w-px ${dark ? 'bg-slate-600' : 'bg-slate-200'}`} />
+            <button onClick={undo} className={`${btn} ${idle}`} title="Undo (Ctrl+Z)" disabled={history.length === 0}>
+              <RotateCcw size={14} />
+              <span className="text-[10px]">Undo</span>
+            </button>
+            <button onClick={redo} className={`${btn} ${idle}`} title="Redo (Ctrl+Y)" disabled={redoStack.length === 0}>
+              <RotateCw size={14} />
+              <span className="text-[10px]">Redo</span>
+            </button>
+            <div className={`mx-1 h-5 w-px ${dark ? 'bg-slate-600' : 'bg-slate-200'}`} />
             <button onClick={exportJSON} className={`${btn} ${idle}`} title="Export JSON"><Download size={14} /></button>
             <button onClick={importJSON} className={`${btn} ${idle}`} title="Import JSON"><Upload size={14} /></button>
+            <button onClick={exportPDF} className={`${btn} ${idle}`} title="Export PDF documentation"><FileText size={14} /></button>
             <button onClick={centerView} className={`${btn} ${idle}`} title="Center view on scheme"><Crosshair size={14} /></button>
-            <button onClick={() => setCamera({ zoom: 1, offsetX: 40, offsetY: 40 })} className={`${btn} ${idle}`} title="Reset zoom"><RotateCcw size={14} /></button>
             <span className="font-mono text-[11px] opacity-50">{Math.round(camera.zoom * 100)}%</span>
-            <div className={`mx-1 h-5 w-px ${dark ? 'bg-slate-600' : 'bg-slate-200'}`} />
-            <button
-              onClick={() => setWireMode((m) => m === 'drag' ? 'click' : 'drag')}
-              className={`${btn} ${wireMode === 'click' ? active : idle}`}
-              title={wireMode === 'drag' ? 'Wire mode: Drag (switch to Click-to-Connect)' : 'Wire mode: Click-to-Connect (switch to Drag)'}
-            >
-              {wireMode === 'drag' ? <MousePointer2 size={14} /> : <Link2 size={14} />}
-              <span className="text-[10px]">{wireMode === 'drag' ? 'Drag' : 'Click'}</span>
-            </button>
             <div className="flex-1" />
             <button onClick={() => setDark((d) => !d)} className={`${btn} ${idle}`}>
               {dark ? <Sun size={14} /> : <Moon size={14} />}
@@ -1953,6 +2260,7 @@ export default function LogicMaker() {
           <div className="flex gap-1.5">
             {(['INPUT', 'OUTPUT', 'CLOCK', 'BUTTON'] as PrimitiveType[]).map((k) => (
               <button key={k} onClick={() => setPlacement({ type: 'PRIMITIVE', kind: k })}
+                onContextMenu={(e) => { e.preventDefault(); setPaletteCtxMenu({ x: e.clientX, y: e.clientY, placement: { type: 'PRIMITIVE', kind: k } }) }}
                 className={`${btn} ${isPrim(k) ? active : idle}`}>
                 <span className={`grid h-7 w-7 place-items-center rounded text-xs font-bold ring-1 ${dark ? 'bg-slate-700 ring-slate-600' : 'bg-slate-100 ring-slate-200'}`}
                   style={{ color: GATE_EDGE[k] }}>
@@ -1972,6 +2280,7 @@ export default function LogicMaker() {
           <div className="flex gap-1.5">
             {(['AND', 'OR', 'NOT'] as PrimitiveType[]).map((k) => (
               <button key={k} onClick={() => setPlacement({ type: 'PRIMITIVE', kind: k })}
+                onContextMenu={(e) => { e.preventDefault(); setPaletteCtxMenu({ x: e.clientX, y: e.clientY, placement: { type: 'PRIMITIVE', kind: k } }) }}
                 className={`${btn} ${isPrim(k) ? active : idle}`}>
                 <span className={`grid h-7 w-7 place-items-center rounded text-sm font-bold ring-1 ${dark ? 'bg-slate-700 ring-slate-600' : 'bg-slate-100 ring-slate-200'}`}
                   style={{ color: GATE_EDGE[k] }}>
@@ -1988,6 +2297,7 @@ export default function LogicMaker() {
           <div className="flex gap-1.5">
             {builtinChips.map((c) => (
               <button key={c.id} onClick={() => setPlacement({ type: 'CHIP', chipId: c.id })}
+                onContextMenu={(e) => { e.preventDefault(); setPaletteCtxMenu({ x: e.clientX, y: e.clientY, placement: { type: 'CHIP', chipId: c.id } }) }}
                 className={`${btn} ${isChip(c.id) ? active : idle}`}>
                 <span className={`grid h-7 min-w-7 place-items-center rounded px-1 text-xs font-bold ring-1 ${dark ? 'bg-slate-700' : 'bg-slate-100'}`}
                   style={{ color: c.color, borderColor: c.color + '66' }}>
@@ -2001,11 +2311,11 @@ export default function LogicMaker() {
         {customChips.length > 0 && (
           <>
             <div className={`my-1 w-px ${dark ? 'bg-slate-600' : 'bg-slate-200'}`} />
-            <section className="flex min-w-0 flex-col">
+            <section className="flex min-w-0 flex-1 flex-col">
               <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wider opacity-50">Custom</h3>
-              <div className="flex gap-2.5 overflow-x-auto pt-1">
+              <div className="flex gap-2.5 overflow-x-auto pt-3 pb-1">
                 {customChips.map((c) => (
-                  <div key={c.id} className="relative flex flex-col items-center">
+                  <div key={c.id} className="relative flex shrink-0 flex-col items-center">
                     <button
                       type="button"
                       onClick={(e) => { e.stopPropagation(); enterEditChip(c.id) }}
@@ -2015,6 +2325,7 @@ export default function LogicMaker() {
                       <Pencil size={11} />
                     </button>
                     <button onClick={() => setPlacement({ type: 'CHIP', chipId: c.id })}
+                      onContextMenu={(e) => { e.preventDefault(); setPaletteCtxMenu({ x: e.clientX, y: e.clientY, placement: { type: 'CHIP', chipId: c.id } }) }}
                       className={`${btn} ${isChip(c.id) ? active : idle}`}>
                       <span className={`grid h-7 min-w-7 place-items-center rounded px-1 text-xs font-bold ring-1 ${dark ? 'bg-slate-700' : 'bg-slate-100'}`}
                         style={{ color: c.color, borderColor: c.color + '66' }}>
@@ -2030,25 +2341,33 @@ export default function LogicMaker() {
         )}
       </footer>
 
+      {paletteCtxMenu && (
+        <div className={`fixed z-50 overflow-hidden rounded-lg border py-1 shadow-xl ${dark ? 'border-slate-600 bg-slate-800' : 'border-slate-200 bg-white'}`}
+          style={{ left: paletteCtxMenu.x, top: paletteCtxMenu.y }} onMouseLeave={() => setPaletteCtxMenu(null)}>
+          <div className={`px-3 py-1 text-[10px] font-semibold uppercase tracking-wider opacity-50`}>Швидке створення</div>
+          {[2, 4, 8].map((n) => (
+            <button key={n} className={menuItemCls} onClick={() => batchCreate(paletteCtxMenu.placement, n)}>
+              <Layers size={14} /> Створити ×{n}
+            </button>
+          ))}
+        </div>
+      )}
+
       {ctxMenu && (
         <div className={`fixed z-50 overflow-hidden rounded-lg border py-1 shadow-xl ${dark ? 'border-slate-600 bg-slate-800' : 'border-slate-200 bg-white'}`}
           style={{ left: ctxMenu.x, top: ctxMenu.y }} onMouseLeave={() => setCtxMenu(null)}>
           {ctxMenu.target === 'wire' ? (
             <>
-              <button className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ${dark ? 'text-slate-200 hover:bg-slate-700' : 'text-slate-700 hover:bg-slate-50'}`}
-                onClick={() => ctxAction('addPoint')}>
+              <button className={menuItemCls} onClick={() => ctxAction('addPoint')}>
                 <Pencil size={14} /> Add point
               </button>
-              <button className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ${dark ? 'text-slate-200 hover:bg-slate-700' : 'text-slate-700 hover:bg-slate-50'}`}
-                onClick={() => ctxAction('smooth')}>
-                Smooth curve
+              <button className={menuItemCls} onClick={() => ctxAction('toggleStraight')}>
+                {(() => {
+                  const w = wires.find((x) => x.id === ctxMenu.wireId)
+                  return w?.straight ? 'Switch to smooth' : 'Switch to straight'
+                })()}
               </button>
-              <button className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ${dark ? 'text-slate-200 hover:bg-slate-700' : 'text-slate-700 hover:bg-slate-50'}`}
-                onClick={() => ctxAction('straight')}>
-                Straight segments
-              </button>
-              <button className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ${dark ? 'text-slate-200 hover:bg-slate-700' : 'text-slate-700 hover:bg-slate-50'}`}
-                onClick={() => ctxAction('clearMids')}>
+              <button className={menuItemCls} onClick={() => ctxAction('clearMids')}>
                 Clear control points
               </button>
               <div className={`my-1 border-t ${dark ? 'border-slate-600' : 'border-slate-100'}`} />
@@ -2064,8 +2383,7 @@ export default function LogicMaker() {
                 { a: 'copy', icon: <Copy size={14} />, label: 'Copy', k: 'Ctrl+C' },
                 { a: 'paste', icon: <ClipboardPaste size={14} />, label: 'Paste', k: 'Ctrl+V' },
               ].map((item) => (
-                <button key={item.a} className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ${dark ? 'text-slate-200 hover:bg-slate-700' : 'text-slate-700 hover:bg-slate-50'}`}
-                  onClick={() => ctxAction(item.a)}>
+                <button key={item.a} className={menuItemCls} onClick={() => ctxAction(item.a)}>
                   {item.icon} {item.label}
                   <span className="ml-auto text-[10px] opacity-50">{item.k}</span>
                 </button>
@@ -2081,21 +2399,58 @@ export default function LogicMaker() {
               })() && (
                   <>
                     <div className={`my-1 border-t ${dark ? 'border-slate-600' : 'border-slate-100'}`} />
-                    <button className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ${dark ? 'text-slate-200 hover:bg-slate-700' : 'text-slate-700 hover:bg-slate-50'}`}
-                      onClick={() => ctxAction('rename')}><Type size={14} /> Rename</button>
+                    <button className={menuItemCls} onClick={() => ctxAction('rename')}><Type size={14} /> Rename</button>
+                  </>
+                )}
+              {ctxMenu.target === 'node' && ctxMenu.nodeId && (
+                <>
+                  <div className={`my-1 border-t ${dark ? 'border-slate-600' : 'border-slate-100'}`} />
+                  <button className={menuItemCls} onClick={() => ctxAction('rotate')}>
+                    <RotateCw size={14} /> Повернути 90°
+                  </button>
+                </>
+              )}
+              {ctxMenu.target === 'node' && ctxMenu.nodeId && (() => {
+                const n = nodes.find((x) => x.id === ctxMenu.nodeId)
+                return n && (n.kind === 'AND' || n.kind === 'OR' || n.kind === 'NOT')
+              })() && (
+                  <>
+                    <div className={`my-1 border-t ${dark ? 'border-slate-600' : 'border-slate-100'}`} />
+                    <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider opacity-50">Замінити на</div>
+                    {(['AND', 'OR', 'NOT'] as PrimitiveType[])
+                      .filter((k) => k !== nodes.find((x) => x.id === ctxMenu.nodeId)?.kind)
+                      .map((k) => (
+                        <button key={k} className={menuItemCls} onClick={() => ctxAction(`replace:${k}`)}>
+                          {k}
+                        </button>
+                      ))}
                   </>
                 )}
               {ctxMenu.target === 'chip' && (
                 <>
                   <div className={`my-1 border-t ${dark ? 'border-slate-600' : 'border-slate-100'}`} />
-                  <button className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ${dark ? 'text-slate-200 hover:bg-slate-700' : 'text-slate-700 hover:bg-slate-50'}`}
-                    onClick={() => ctxAction('edit')}><Pencil size={14} /> Edit</button>
-                  <button className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ${dark ? 'text-slate-200 hover:bg-slate-700' : 'text-slate-700 hover:bg-slate-50'}`}
-                    onClick={() => ctxAction('color')}><Palette size={14} /> Change color</button>
+                  <button className={menuItemCls} onClick={() => ctxAction('edit')}><Pencil size={14} /> Edit</button>
+                  <button className={menuItemCls} onClick={() => ctxAction('color')}><Palette size={14} /> Change color</button>
+                  <button className={menuItemCls} onClick={() => ctxAction('explode')}><Layers size={14} /> Розгорнутий вигляд</button>
                 </>
               )}
             </>
           )}
+        </div>
+      )}
+
+      {explodeView && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6" onClick={() => setExplodeView(null)}>
+          <div
+            className={`max-h-full max-w-full overflow-auto rounded-xl border p-4 shadow-xl ${dark ? 'border-slate-600 bg-slate-800' : 'border-slate-200 bg-white'}`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-2 flex items-center justify-between gap-6">
+              <h2 className="text-sm font-semibold">Схема: {explodeView.title}</h2>
+              <button onClick={() => setExplodeView(null)} className={`${btn} ${idle}`}>Закрити</button>
+            </div>
+            <img src={explodeView.dataUrl} alt={explodeView.title} className="max-w-none rounded-md border" />
+          </div>
         </div>
       )}
 
