@@ -113,8 +113,16 @@ interface ContextMenuState {
 interface DrawSession {
   from: PinRef
   fromPos: Vec2
-  /** Committed orthogonal corners. The current mouse position is preview-only. */
+  /** Committed orthogonal path. The current mouse position is preview-only. */
   points: Vec2[]
+  /** Last snapped cursor position, used to distinguish backtracking from a stationary move. */
+  cursor: Vec2
+  /**
+   * Sticky bend preference for the free leading segment.
+   * null = not yet established (first significant movement after a lock chooses it).
+   * Once set, the free L-shape keeps this orientation so the path never flips.
+   */
+  preferH: boolean | null
 }
 
 const pinKey = (n: string, p: string) => `${n}:${p}`
@@ -696,6 +704,20 @@ function projectOnSegment(p: Vec2, a: Vec2, b: Vec2) {
   return { point, dist: Math.hypot(p.x - point.x, p.y - point.y), t }
 }
 
+/** Wire geometry uses the same half-grid used by pin centers. */
+const snapWirePoint = (p: Vec2): Vec2 => ({ x: snapHalf(p.x), y: snapHalf(p.y) })
+
+/** Snap a cursor to a point on an existing orthogonal segment without leaving that segment. */
+function snapPointToSegment(p: Vec2, a: Vec2, b: Vec2): Vec2 {
+  const horizontal = Math.abs(a.y - b.y) <= 0.5
+  if (horizontal) {
+    const x = clamp(snapHalf(p.x), Math.min(a.x, b.x), Math.max(a.x, b.x))
+    return { x, y: a.y }
+  }
+  const y = clamp(snapHalf(p.y), Math.min(a.y, b.y), Math.max(a.y, b.y))
+  return { x: a.x, y }
+}
+
 function collapsePolyline(points: Vec2[], epsilon = 0.75): Vec2[] {
   if (points.length <= 2) return points.map((p) => ({ ...p }))
   const out: Vec2[] = []
@@ -718,38 +740,64 @@ function collapsePolyline(points: Vec2[], epsilon = 0.75): Vec2[] {
 }
 
 /**
- * Build the shortest clean Manhattan tail from the last committed corner to
- * the current mouse position. The cursor can move freely, but the wire itself
- * is always horizontal/vertical.
+ * Preview only: build exactly one dynamic Manhattan bend from the last
+ * committed waypoint to the snapped cursor. The committed history is never
+ * changed while the pointer moves.
+ *
+ * Orientation priority (never rewrites committed points):
+ * 1. Sticky preferH from the active DrawSession (locks first free segment).
+ * 2. Continue the direction of the last committed segment when available.
+ * 3. Fall back to the larger axis delta only when neither is known.
  */
-function orthogonalPathTo(points: Vec2[], next: Vec2): Vec2[] {
-  if (!points.length) return [{ ...next }]
+function orthogonalPathTo(points: Vec2[], next: Vec2, preferH: boolean | null = null): Vec2[] {
+  if (!points.length) return [snapWirePoint(next)]
 
-  const base = collapsePolyline(points)
+  const base = collapsePolyline(points.map(snapWirePoint))
   const last = base[base.length - 1]
-  const dx = next.x - last.x
-  const dy = next.y - last.y
-  const epsilon = 0.75
+  const target = snapWirePoint(next)
+  const dx = target.x - last.x
+  const dy = target.y - last.y
 
-  if (Math.abs(dx) <= epsilon) {
-    return collapsePolyline([...base, { x: last.x, y: next.y }])
+  if (dx === 0 || dy === 0) return collapsePolyline([...base, target])
+
+  let useH: boolean
+  if (preferH !== null) {
+    useH = preferH
+  } else if (base.length >= 2) {
+    // Continue the last committed segment's axis so the free bend does not flip it.
+    const prev = base[base.length - 2]
+    useH = Math.abs(prev.y - last.y) <= 0.5
+  } else {
+    useH = Math.abs(dx) >= Math.abs(dy)
   }
-  if (Math.abs(dy) <= epsilon) {
-    return collapsePolyline([...base, { x: next.x, y: last.y }])
-  }
 
-  // Follow the dominant mouse direction first. This gives the same
-  // predictable one-bend routing used by classic circuit editors.
-  const corner = Math.abs(dx) >= Math.abs(dy)
-    ? { x: next.x, y: last.y }
-    : { x: last.x, y: next.y }
-
-  return collapsePolyline([...base, corner, next])
+  const corner = useH
+    ? { x: target.x, y: last.y }
+    : { x: last.x, y: target.y }
+  return collapsePolyline([...base, corner, target])
 }
 
-/** Add a permanent bend/corner at the clicked position. */
-function addOrthogonalAnchor(points: Vec2[], next: Vec2): Vec2[] {
-  return orthogonalPathTo(points, next)
+/** Commit the current one-corner preview. Only a click can change this history. */
+function addOrthogonalAnchor(points: Vec2[], next: Vec2, preferH: boolean | null = null): Vec2[] {
+  return orthogonalPathTo(points, next, preferH)
+}
+
+/** Repair only endpoint-induced diagonal links (for example after a node moves). */
+function ensureOrthogonalPolyline(points: Vec2[]): Vec2[] {
+  if (points.length < 2) return points.map((p) => ({ ...p }))
+  const out: Vec2[] = [{ ...points[0] }]
+  for (let i = 1; i < points.length; i++) {
+    const target = { ...points[i] }
+    const last = out[out.length - 1]
+    if (last.x !== target.x && last.y !== target.y) {
+      const corner = Math.abs(target.x - last.x) >= Math.abs(target.y - last.y)
+        ? { x: target.x, y: last.y }
+        : { x: last.x, y: target.y }
+      out.push(corner)
+    }
+    out.push(target)
+  }
+  return collapsePolyline(out)
 }
 
 /* ------------------------------------------------------------------
@@ -780,10 +828,10 @@ function wireView(w: Wire, nodes: CircuitNode[], junctions: Junction[]): { pts: 
   const b = anchorOf(w.to.nodeId, w.to.pinId, w.to.side, nodes, junctions)
   if (!a || !b) return null
   const stored = w.points?.length ? w.points : [a, b]
-  const pts = stored.map((p) => ({ ...p }))
-  pts[0] = a
-  pts[pts.length - 1] = b
-  return { pts: collapsePolyline(pts) }
+  const pts = stored.map(snapWirePoint)
+  pts[0] = { ...a }
+  pts[pts.length - 1] = { ...b }
+  return { pts: ensureOrthogonalPolyline(pts) }
 }
 
 function drawBody(
@@ -1048,6 +1096,62 @@ function drawUnfoldedChip(
   }
 }
 
+interface BridgeCrossing {
+  point: Vec2
+  overWireId: string
+  underWireId: string
+}
+
+/**
+ * Find all H/V crossings once when the circuit geometry changes. The renderer
+ * only consumes these cached crossing coordinates while signal/hover state is
+ * animated every frame.
+ */
+function computeBridgeCrossings(
+  wirePolys: { w: Wire; pts: Vec2[] }[],
+  junctions: Junction[],
+): BridgeCrossing[] {
+  const hasJunctionAt = (p: Vec2) => junctions.some((j) =>
+    Math.abs(j.point.x - p.x) <= 0.5 && Math.abs(j.point.y - p.y) <= 0.5)
+  const result: BridgeCrossing[] = []
+  const seen = new Set<string>()
+
+  const segments: { wireId: string; a: Vec2; b: Vec2 }[] = []
+  for (const { w, pts } of wirePolys) {
+    for (let i = 0; i < pts.length - 1; i++) {
+      const a = pts[i], b = pts[i + 1]
+      if (Math.abs(a.x - b.x) <= 0.5 || Math.abs(a.y - b.y) <= 0.5) {
+        segments.push({ wireId: w.id, a, b })
+      }
+    }
+  }
+
+  for (const v of segments) {
+    const vertical = Math.abs(v.a.x - v.b.x) <= 0.5 && Math.abs(v.a.y - v.b.y) > 0.5
+    if (!vertical) continue
+    const vx = v.a.x
+    const vy0 = Math.min(v.a.y, v.b.y), vy1 = Math.max(v.a.y, v.b.y)
+
+    for (const h of segments) {
+      if (h.wireId === v.wireId) continue
+      const horizontal = Math.abs(h.a.y - h.b.y) <= 0.5 && Math.abs(h.a.x - h.b.x) > 0.5
+      if (!horizontal) continue
+      const hy = h.a.y
+      const hx0 = Math.min(h.a.x, h.b.x), hx1 = Math.max(h.a.x, h.b.x)
+      if (vx < hx0 || vx > hx1 || hy < vy0 || hy > vy1) continue
+
+      const point = { x: vx, y: hy }
+      if (hasJunctionAt(point)) continue
+      const key = `${v.wireId}:${h.wireId}:${vx}:${hy}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      result.push({ point, overWireId: v.wireId, underWireId: h.wireId })
+    }
+  }
+
+  return result
+}
+
 function drawScene(
   ctx: CanvasRenderingContext2D, sw: number, sh: number, dpr: number,
   cam: Camera, nodes: CircuitNode[], wires: Wire[], junctions: Junction[], signal: SignalMap,
@@ -1055,6 +1159,7 @@ function drawScene(
   chipMeta: Record<string, { color: string }>,
   chipById: Record<string, ChipDefinition>,
   drawingPreview: { fromPos: Vec2; pts: Vec2[] } | null,
+  bridgeCrossings: BridgeCrossing[],
   box: { x: number; y: number; w: number; h: number } | null,
   placingNode: CircuitNode | null,
   theme: Theme, dark: boolean,
@@ -1070,7 +1175,6 @@ function drawScene(
   const wr = (sw - offsetX) / zoom, wb = (sh - offsetY) / zoom
   drawGrid(ctx, wl, wt, wr, wb, zoom, theme.grid)
 
-  const byId = new Map(nodes.map((n) => [n.id, n]))
   const wireActive = (w: Wire) => !!signal[pinKey(w.from.nodeId, w.from.pinId)]
 
   // Pre-compute polylines with obstacle avoidance, then run the lane solver.
@@ -1086,21 +1190,6 @@ function drawScene(
       isSel: selectedWireId === w.id || selectedWireIds.has(w.id),
     })
   }
-  type HSeg = { y: number; x0: number; x1: number; high: boolean; hover: boolean; isSel: boolean }
-  const hSegs: HSeg[] = []
-  for (const { pts, high, hover, isSel } of wirePolys) {
-    for (let i = 0; i < pts.length - 1; i++) {
-      const p0 = pts[i], p1 = pts[i + 1]
-      if (Math.abs(p0.y - p1.y) > 0.5) continue
-      hSegs.push({
-        y: p0.y,
-        x0: Math.min(p0.x, p1.x),
-        x1: Math.max(p0.x, p1.x),
-        high, hover, isSel,
-      })
-    }
-  }
-
   type Seg = { wireId: string; a: Vec2; b: Vec2; high: boolean; hover: boolean; isSel: boolean }
   const segments: Seg[] = []
   for (const { w, pts, high, hover, isSel } of wirePolys) {
@@ -1109,53 +1198,95 @@ function drawScene(
     }
   }
 
-  const strokeSeg = (seg: Seg) => {
+  const bridgeByWire = new Map<string, Vec2[]>()
+  for (const bridge of bridgeCrossings) {
+    const list = bridgeByWire.get(bridge.overWireId) ?? []
+    list.push(bridge.point)
+    bridgeByWire.set(bridge.overWireId, list)
+  }
+
+  const drawSegmentPieces = (seg: Seg, glow: boolean) => {
     const a = seg.a, b = seg.b
-    ctx.strokeStyle = seg.isSel ? theme.sel : seg.hover ? theme.wireHover : seg.high ? theme.wireHigh : theme.wireLow
-    ctx.lineWidth = seg.isSel ? clamp(3 / zoom, 1.6, 3.4) : clamp(2.1 / zoom, 1.2, 2.6)
+    const horizontal = Math.abs(a.y - b.y) <= 0.5
+    const vertical = Math.abs(a.x - b.x) <= 0.5
+    const crossings = (bridgeByWire.get(seg.wireId) ?? [])
+      .filter((p) => horizontal
+        ? Math.abs(p.y - a.y) <= 0.5 && p.x >= Math.min(a.x, b.x) && p.x <= Math.max(a.x, b.x)
+        : vertical
+          ? Math.abs(p.x - a.x) <= 0.5 && p.y >= Math.min(a.y, b.y) && p.y <= Math.max(a.y, b.y)
+          : false)
+      .sort((p, q) => horizontal ? p.x - q.x : p.y - q.y)
+
+    const radius = 6 / zoom
+    const lineWidth = glow ? 7 / zoom
+      : seg.isSel ? clamp(3 / zoom, 1.6, 3.4)
+        : clamp(2.1 / zoom, 1.2, 2.6)
+
+    ctx.strokeStyle = glow ? theme.wireHigh + '30'
+      : seg.isSel ? theme.sel : seg.hover ? theme.wireHover : seg.high ? theme.wireHigh : theme.wireLow
+    ctx.lineWidth = lineWidth
     if (seg.hover || seg.isSel) ctx.setLineDash([5 / zoom, 3 / zoom])
-    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke()
+
+    if (!crossings.length) {
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke()
+      ctx.setLineDash([])
+      return
+    }
+
+    let cursor = horizontal ? Math.min(a.x, b.x) : Math.min(a.y, b.y)
+    const end = horizontal ? Math.max(a.x, b.x) : Math.max(a.y, b.y)
+    const reverse = horizontal ? b.x < a.x : b.y < a.y
+
+    const drawRange = (from: number, to: number) => {
+      if (to - from <= 0.01) return
+      const p0 = horizontal
+        ? { x: reverse ? to : from, y: a.y }
+        : { x: a.x, y: reverse ? to : from }
+      const p1 = horizontal
+        ? { x: reverse ? from : to, y: a.y }
+        : { x: a.x, y: reverse ? from : to }
+      ctx.beginPath(); ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.stroke()
+    }
+
+    for (const crossing of crossings) {
+      const at = horizontal ? crossing.x : crossing.y
+      const gapStart = Math.max(cursor, at - radius)
+      const gapEnd = Math.min(end, at + radius)
+      drawRange(cursor, gapStart)
+      cursor = Math.max(cursor, gapEnd)
+    }
+    drawRange(cursor, end)
     ctx.setLineDash([])
   }
 
-  // Draw every path once. A high-signal glow is kept underneath the main stroke.
+  // Draw each stored segment once. At a cached crossing the vertical wire has
+  // a real gap; the jumper below replaces that gap instead of being painted
+  // over an already-complete line.
   for (const seg of segments) {
-    if (seg.high) {
-      ctx.save(); ctx.strokeStyle = theme.wireHigh + '30'; ctx.lineWidth = 7 / zoom
-      ctx.beginPath(); ctx.moveTo(seg.a.x, seg.a.y); ctx.lineTo(seg.b.x, seg.b.y); ctx.stroke(); ctx.restore()
-    }
-    strokeSeg(seg)
+    if (seg.high) drawSegmentPieces(seg, true)
+    drawSegmentPieces(seg, false)
   }
 
-  // Crossing bridges: only unrelated horizontal/vertical wires get a bridge.
-  // A junction at the intersection explicitly disables the bridge and represents
-  // an intentional electrical connection instead.
-  const hasJunctionAt = (p: Vec2) => junctions.some((j) => Math.hypot(j.point.x - p.x, j.point.y - p.y) <= 1.5)
-  const drawnCrossings = new Set<string>()
-  for (const v of segments) {
-    const vIsVertical = Math.abs(v.a.x - v.b.x) <= 0.5 && Math.abs(v.a.y - v.b.y) > 0.5
-    if (!vIsVertical) continue
-    const vx = v.a.x
-    const vy0 = Math.min(v.a.y, v.b.y), vy1 = Math.max(v.a.y, v.b.y)
-    for (const h of segments) {
-      if (h.wireId === v.wireId) continue
-      const hIsHorizontal = Math.abs(h.a.y - h.b.y) <= 0.5 && Math.abs(h.a.x - h.b.x) > 0.5
-      if (!hIsHorizontal) continue
-      const hy = h.a.y
-      const hx0 = Math.min(h.a.x, h.b.x), hx1 = Math.max(h.a.x, h.b.x)
-      if (vx < hx0 - 0.5 || vx > hx1 + 0.5 || hy < vy0 - 0.5 || hy > vy1 + 0.5) continue
-      const crossing = { x: vx, y: hy }
-      const crossingKey = `${Math.round(vx * 2) / 2}:${Math.round(hy * 2) / 2}`
-      if (drawnCrossings.has(crossingKey) || hasJunctionAt(crossing)) continue
-      drawnCrossings.add(crossingKey)
-      const r = 6 / zoom
-      const color = v.isSel ? theme.sel : v.hover ? theme.wireHover : v.high ? theme.wireHigh : theme.wireLow
-      ctx.strokeStyle = color
-      ctx.lineWidth = v.isSel ? clamp(3 / zoom, 1.6, 3.4) : clamp(2.1 / zoom, 1.2, 2.6)
-      ctx.beginPath(); ctx.moveTo(vx, hy - r); ctx.lineTo(vx, hy - r / 2); ctx.stroke()
-      ctx.beginPath(); ctx.arc(vx, hy, r, Math.PI, 0, false); ctx.stroke()
-      ctx.beginPath(); ctx.moveTo(vx, hy + r); ctx.lineTo(vx, hy + r / 2); ctx.stroke()
-    }
+  // Draw the cached bridge after the line gaps have been created. Geometry is
+  // never recomputed here; only the current wire visual state is read.
+  for (const bridge of bridgeCrossings) {
+    const seg = segments.find((s) => s.wireId === bridge.overWireId
+      && Math.abs(s.a.x - s.b.x) <= 0.5
+      && bridge.point.x === s.a.x
+      && bridge.point.y >= Math.min(s.a.y, s.b.y)
+      && bridge.point.y <= Math.max(s.a.y, s.b.y))
+    if (!seg) continue
+    const { x, y } = bridge.point
+    const r = 6 / zoom
+    const color = seg.isSel ? theme.sel : seg.hover ? theme.wireHover : seg.high ? theme.wireHigh : theme.wireLow
+    ctx.strokeStyle = color
+    ctx.lineWidth = seg.isSel ? clamp(3 / zoom, 1.6, 3.4) : clamp(2.1 / zoom, 1.2, 2.6)
+    if (seg.hover || seg.isSel) ctx.setLineDash([5 / zoom, 3 / zoom])
+    ctx.beginPath()
+    ctx.moveTo(x, y - r)
+    ctx.bezierCurveTo(x + 2 * r, y - r * 0.65, x + 2 * r, y + r * 0.65, x, y + r)
+    ctx.stroke()
+    ctx.setLineDash([])
   }
 
   // Junction dots
@@ -1242,7 +1373,7 @@ function renderNodesToImage(
   const cam: Camera = { zoom: 1, offsetX: -minX + padding, offsetY: -minY + padding }
   drawScene(
     ctx, w, h, scale, cam, nodes, wires, [], {}, new Set(), null, new Set(), null,
-    chipMeta, {}, null, null, null, theme, dark,
+    chipMeta, {}, null, [], null, null, theme, dark,
   )
   return { dataUrl: canvas.toDataURL('image/png'), width: w, height: h }
 }
@@ -1307,6 +1438,7 @@ export default function LogicMaker() {
   const hoverWire = useRef<string | null>(null)
   const signal = useRef<SignalMap>({})
   const mousePos = useRef<Vec2>({ x: 0, y: 0 })
+  const bridgeCrossings = useRef<BridgeCrossing[]>([])
   const hasLoaded = useRef(false)
   const modalOpen = useRef(false)
   const buttonHeld = useRef<string | null>(null)
@@ -1315,6 +1447,18 @@ export default function LogicMaker() {
   useEffect(() => {
     live.current = { nodes, wires, junctions, chips, selected, selectedWireId, selectedWireIds, placement, camera }
   })
+
+  // Crossing geometry is static between circuit edits. Rebuild it only when
+  // wires, nodes, or junctions change instead of doing intersection work in
+  // the animation frame.
+  useEffect(() => {
+    const wirePolys: { w: Wire; pts: Vec2[] }[] = []
+    for (const w of wires) {
+      const vw = wireView(w, nodes, junctions)
+      if (vw) wirePolys.push({ w, pts: vw.pts })
+    }
+    bridgeCrossings.current = computeBridgeCrossings(wirePolys, junctions)
+  }, [wires, nodes, junctions])
   useEffect(() => {
     modalOpen.current = !!(createModal || clockModal || renamePinModal || changeBlockModal)
   }, [createModal, clockModal, renamePinModal, changeBlockModal])
@@ -1341,10 +1485,13 @@ export default function LogicMaker() {
       if (!w) return j
       const vw = wireView(w, nodes, junctions)
       if (!vw) return j
-      let best = j.point, bestD = Infinity
+      let best = snapWirePoint(j.point), bestD = Infinity
       for (let i = 0; i < vw.pts.length - 1; i++) {
         const pr = projectOnSegment(j.point, vw.pts[i], vw.pts[i + 1])
-        if (pr.dist < bestD) { bestD = pr.dist; best = pr.point }
+        if (pr.dist < bestD) {
+          bestD = pr.dist
+          best = snapPointToSegment(j.point, vw.pts[i], vw.pts[i + 1])
+        }
       }
       if (Math.hypot(best.x - j.point.x, best.y - j.point.y) > 0.5) {
         changed = true
@@ -1420,15 +1567,25 @@ export default function LogicMaker() {
     return screenToWorld(e.clientX - r.left, e.clientY - r.top)
   }
 
-  const findPinAt = (p: Vec2) => {
+  const findPinAt = (p: Vec2, extraGrab = 0) => {
     let best: EnumeratedPin | null = null, bestD = Infinity
-    const grab = (PIN_R + 7) / live.current.camera.zoom
+    // Screen-stable hit radius; extraGrab (world units) is used while drafting for magnetic snap.
+    const grab = (PIN_R + 7) / live.current.camera.zoom + extraGrab
     for (const n of live.current.nodes)
       for (const pin of enumeratePins(n)) {
         const d = Math.hypot(p.x - pin.pos.x, p.y - pin.pos.y)
         if (d < grab && d < bestD) { bestD = d; best = pin }
       }
     return best
+  }
+
+  /** True if a pin is a valid wire endpoint for the current drawing session. */
+  const isValidWireTarget = (pin: EnumeratedPin, from: PinRef) => {
+    if (pin.nodeId === from.nodeId) return false
+    // After normalisation we need an out→in pair; either orientation is fine here.
+    if (from.side === 'out' && pin.side === 'in') return true
+    if (from.side === 'in' && pin.side === 'out') return true
+    return false
   }
   const findNodeAt = (p: Vec2) => {
     for (let i = live.current.nodes.length - 1; i >= 0; i--)
@@ -1463,10 +1620,13 @@ export default function LogicMaker() {
     if (!w) return null
     const vw = wireView(w, live.current.nodes, live.current.junctions)
     if (!vw) return null
-    let best = p, bestD = Infinity
+    let best: Vec2 | null = null, bestD = Infinity
     for (let i = 0; i < vw.pts.length - 1; i++) {
       const pr = projectOnSegment(p, vw.pts[i], vw.pts[i + 1])
-      if (pr.dist < bestD) { bestD = pr.dist; best = pr.point }
+      if (pr.dist < bestD) {
+        bestD = pr.dist
+        best = snapPointToSegment(p, vw.pts[i], vw.pts[i + 1])
+      }
     }
     return best
   }
@@ -1531,12 +1691,15 @@ export default function LogicMaker() {
   /* ---------------- interactive orthogonal wire drawing ---------------- */
 
   const startDrawing = (pin: EnumeratedPin) => {
+    const start = snapWirePoint(pin.pos)
     drawing.current = {
       from: { nodeId: pin.nodeId, pinId: pin.pinId, side: pin.side },
-      fromPos: { ...pin.pos },
-      points: [{ ...pin.pos }],
+      fromPos: start,
+      points: [start],
+      cursor: start,
+      preferH: null,
     }
-    mousePos.current = { ...pin.pos }
+    mousePos.current = start
     setSelected(new Set())
     setSelectedWireId(null)
     setSelectedWireIds(new Set())
@@ -1549,12 +1712,22 @@ export default function LogicMaker() {
     if (!d) return
     let a = d.from
     let b: PinRef = { nodeId, pinId, side }
+    // Allow either direction; normalise so wires always store out → in.
     if (a.side === 'in' && b.side === 'out') { const t = a; a = b; b = t }
-    if (a.side !== 'out' || b.side !== 'in' || a.nodeId === b.nodeId) { cancelDrawing(); return }
+    // Junction pseudo-pins use side 'in' when targeted; treat junction ids as valid sinks.
+    const toIsJunction = !!live.current.junctions.find((j) => j.id === b.nodeId)
+    const fromIsJunction = !!live.current.junctions.find((j) => j.id === a.nodeId)
+    if (!toIsJunction && !fromIsJunction) {
+      if (a.side !== 'out' || b.side !== 'in' || a.nodeId === b.nodeId) { cancelDrawing(); return }
+    } else if (a.nodeId === b.nodeId) {
+      cancelDrawing()
+      return
+    }
 
-    const targetPos = endPoint ?? anchorOf(b.nodeId, b.pinId, b.side, live.current.nodes, live.current.junctions)
-    if (!targetPos) { cancelDrawing(); return }
-    let points = orthogonalPathTo(d.points, targetPos)
+    const targetPosRaw = endPoint ?? anchorOf(b.nodeId, b.pinId, b.side, live.current.nodes, live.current.junctions)
+    if (!targetPosRaw) { cancelDrawing(); return }
+    const targetPos = snapWirePoint(targetPosRaw)
+    let points = addOrthogonalAnchor(d.points, targetPos, d.preferH)
     points[0] = { ...d.fromPos }
     points[points.length - 1] = { ...targetPos }
     points = collapsePolyline(points)
@@ -1605,8 +1778,9 @@ export default function LogicMaker() {
     /* ---- Active P2P drawing session ---- */
     if (drawing.current) {
       const d = drawing.current
-      const pinHit = findPinAt(p)
-      if (pinHit && pinHit.nodeId !== d.from.nodeId) {
+      // Larger grab while drafting so clicks near pins reliably complete the wire.
+      const pinHit = findPinAt(p, 10)
+      if (pinHit && isValidWireTarget(pinHit, d.from)) {
         finishDrawing(pinHit.nodeId, pinHit.pinId, pinHit.side, pinHit.pos)
         return
       }
@@ -1616,9 +1790,13 @@ export default function LogicMaker() {
         const j = pt ? createJunctionOnWire(wireHitId, pt) : null
         if (j) { finishDrawing(j.id, 'j', 'in', j.point); return }
       }
-      // Empty clicks commit a clean 90-degree bend. The live tail continues
-      // following the mouse without adding noisy trace points.
-      d.points = addOrthogonalAnchor(d.points, p)
+      // Empty clicks permanently lock the current waypoints/corners. Subsequent
+      // movement only affects the new leading segment (preferH resets).
+      const committed = snapWirePoint(p)
+      d.points = addOrthogonalAnchor(d.points, committed, d.preferH)
+      d.cursor = committed
+      d.preferH = null
+      mousePos.current = committed
       return
     }
 
@@ -1712,14 +1890,57 @@ export default function LogicMaker() {
     mousePos.current = p
 
     if (drawing.current) {
-      // The current cursor position is rendered as a live orthogonal tail;
-      // only explicit clicks become permanent corners.
+      const d = drawing.current
+      // Magnetic snap: when near a valid target pin, lock the free end onto it
+      // so a subsequent click reliably finishes the connection.
+      const magnetPin = findPinAt(p, 12)
+      let target: Vec2
+      if (magnetPin && isValidWireTarget(magnetPin, d.from)) {
+        target = snapWirePoint(magnetPin.pos)
+      } else {
+        target = snapWirePoint(p)
+      }
+      const previousCursor = d.cursor
+      mousePos.current = target
+
+      // Establish sticky orientation once the free segment has moved far enough
+      // from the last locked waypoint. This prevents the path from flipping
+      // when the cursor crosses the 45° diagonal.
+      if (d.preferH === null && d.points.length >= 1) {
+        const last = d.points[d.points.length - 1]
+        const adx = Math.abs(target.x - last.x)
+        const ady = Math.abs(target.y - last.y)
+        const THRESH = HALF_GRID
+        if (adx >= THRESH || ady >= THRESH) {
+          d.preferH = adx >= ady
+        }
+      }
+
+      // Passing back over a committed waypoint rolls the path back. A waypoint
+      // is removed only while the pointer is actually moving toward it; this
+      // prevents the first pointer event after a click from undoing the click.
+      const cursorMoved = previousCursor.x !== target.x || previousCursor.y !== target.y
+      if (cursorMoved && d.points.length > 1) {
+        for (let i = d.points.length - 1; i >= 1; i--) {
+          const wp = d.points[i]
+          if (wp.x === target.x && wp.y === target.y) {
+            d.points = d.points.slice(0, i)
+            // After roll-back, re-derive preference from the new last segment.
+            d.preferH = null
+            break
+          }
+        }
+      }
+      d.cursor = target
       return
     }
 
     if (drag.current?.kind === 'box') { drag.current.endX = p.x; drag.current.endY = p.y }
     else if (drag.current?.kind === 'move') {
-      const d = drag.current, dx = p.x - d.startWorld.x, dy = p.y - d.startWorld.y
+      const d = drag.current
+      // Keep node origins on the main grid so their pin centers remain aligned
+      // with the wire half-grid used by routing.
+      const dx = snap(p.x - d.startWorld.x), dy = snap(p.y - d.startWorld.y)
       const idSet = new Set(d.ids)
       const nextNodes = live.current.nodes.map((n) => idSet.has(n.id)
         ? { ...n, position: { x: d.origin.get(n.id)!.x + dx, y: d.origin.get(n.id)!.y + dy } }
@@ -1742,7 +1963,18 @@ export default function LogicMaker() {
       if (canvasRef.current) canvasRef.current.style.cursor = spaceDown.current ? 'grab' : 'default'
       return
     }
-    if (drawing.current) return
+    // While drafting, also complete the wire on pointer-up if the cursor is
+    // magnetically over a valid target pin (covers near-misses on pointer-down).
+    if (drawing.current) {
+      const r = canvasRect()
+      const p = screenToWorld(e.clientX - r.left, e.clientY - r.top)
+      const d = drawing.current
+      const pinHit = findPinAt(p, 12)
+      if (pinHit && isValidWireTarget(pinHit, d.from)) {
+        finishDrawing(pinHit.nodeId, pinHit.pinId, pinHit.side, pinHit.pos)
+      }
+      return
+    }
 
     const d = drag.current
     if (d?.kind === 'box') {
@@ -2398,7 +2630,7 @@ export default function LogicMaker() {
       let drawingPreview: { fromPos: Vec2; pts: Vec2[] } | null = null
       if (drawing.current) {
         const d = drawing.current
-        const pts = orthogonalPathTo(d.points, mousePos.current)
+        const pts = orthogonalPathTo(d.points, mousePos.current, d.preferH)
         drawingPreview = { fromPos: d.fromPos, pts }
       }
 
@@ -2429,7 +2661,7 @@ export default function LogicMaker() {
 
       drawScene(ctx, cw, ch, dpr, s.camera, s.nodes, s.wires, s.junctions, signal.current,
         s.selected, s.selectedWireId, s.selectedWireIds, hoverWire.current,
-        chipMeta, chipById, drawingPreview, box, placingNode, theme, dark)
+        chipMeta, chipById, drawingPreview, bridgeCrossings.current, box, placingNode, theme, dark)
     }
     loop()
     return () => cancelAnimationFrame(raf)
