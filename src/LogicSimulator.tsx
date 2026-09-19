@@ -64,7 +64,8 @@ interface Wire {
   id: string
   from: PinRef
   to: PinRef
-  mids?: Vec2[]
+  /** Persisted drawing path. Endpoints are refreshed from pin/junction anchors. */
+  points?: Vec2[]
 }
 /** A permanent tap on an existing wire — the origin of a branch. */
 interface Junction {
@@ -103,18 +104,17 @@ interface ContextMenuState {
   x: number
   y: number
   world: Vec2
-  target: 'canvas' | 'node' | 'wire' | 'chip' | 'waypoint' | 'unfoldedChip'
+  target: 'canvas' | 'node' | 'wire' | 'chip' | 'unfoldedChip'
   nodeId?: string
   wireId?: string
-  waypointIndex?: number
 }
 
 /** Active point-to-point drawing session. */
 interface DrawSession {
   from: PinRef
   fromPos: Vec2
-  waypoints: Vec2[]
-  orientation: 'h' | 'v'
+  /** Committed orthogonal corners. The current mouse position is preview-only. */
+  points: Vec2[]
 }
 
 const pinKey = (n: string, p: string) => `${n}:${p}`
@@ -130,9 +130,6 @@ const PIN_SPACING = 24
 const PIN_R = 5.5
 const MIN_ZOOM = 0.05
 const MAX_ZOOM = 4
-const ROUTE_PAD = 18
-/** Mandatory minimum parallel-run separation enforced by the lane solver. */
-const LANE_SPACING = 12
 
 let idCounter = 0
 const uid = (prefix = 'n') =>
@@ -334,8 +331,8 @@ function refreshChipInstance(node: CircuitNode, chip: ChipDefinition): CircuitNo
   }
 }
 
-const createWire = (from: PinRef, to: PinRef, mids?: Vec2[]): Wire =>
-  ({ id: uid('w'), from, to, ...(mids?.length ? { mids } : {}) })
+const createWire = (from: PinRef, to: PinRef, points?: Vec2[]): Wire =>
+  ({ id: uid('w'), from, to, ...(points && points.length >= 2 ? { points } : {}) })
 
 /* Built-ins */
 const outRef = (id: string, pin: string): PinRef => ({ nodeId: id, pinId: pin, side: 'out' })
@@ -683,115 +680,8 @@ function drawGrid(ctx: CanvasRenderingContext2D, left: number, top: number, righ
 }
 
 /* =========================================================
- *  Orthogonal / Manhattan wire routing
+ *  Wire geometry — direct mouse-traced polylines
  * ========================================================= */
-
-function inflatedBox(n: CircuitNode): { x: number; y: number; w: number; h: number } {
-  const b = nodeBox(n)
-  return { x: b.x - ROUTE_PAD, y: b.y - ROUTE_PAD, w: b.w + ROUTE_PAD * 2, h: b.h + ROUTE_PAD * 2 }
-}
-
-function segmentHitsBox(p0: Vec2, p1: Vec2, box: { x: number; y: number; w: number; h: number }): boolean {
-  const minX = Math.min(p0.x, p1.x), maxX = Math.max(p0.x, p1.x)
-  const minY = Math.min(p0.y, p1.y), maxY = Math.max(p0.y, p1.y)
-  if (maxX < box.x || minX > box.x + box.w || maxY < box.y || minY > box.y + box.h) return false
-  if (Math.abs(p0.y - p1.y) < 0.5) {
-    const y = p0.y
-    return y > box.y && y < box.y + box.h && maxX > box.x && minX < box.x + box.w
-  }
-  if (Math.abs(p0.x - p1.x) < 0.5) {
-    const x = p0.x
-    return x > box.x && x < box.x + box.w && maxY > box.y && minY < box.y + box.h
-  }
-  return true
-}
-
-function pathHitsAny(pts: Vec2[], obstacles: { x: number; y: number; w: number; h: number }[]): boolean {
-  for (let i = 0; i < pts.length - 1; i++) {
-    for (const box of obstacles) {
-      if (segmentHitsBox(pts[i], pts[i + 1], box)) return true
-    }
-  }
-  return false
-}
-
-function orthogonalPath(
-  a: Vec2,
-  b: Vec2,
-  mids?: Vec2[],
-  obstacles?: { x: number; y: number; w: number; h: number }[],
-): Vec2[] {
-  const collapse = (pts: Vec2[]): Vec2[] => {
-    const out: Vec2[] = []
-    for (const p of pts) {
-      if (out.length >= 2) {
-        const a0 = out[out.length - 2]
-        const a1 = out[out.length - 1]
-        if (Math.hypot(p.x - a1.x, p.y - a1.y) <= 0.5) continue
-        const horiz = Math.abs(a0.y - a1.y) <= 0.5 && Math.abs(a1.y - p.y) <= 0.5
-        const vert = Math.abs(a0.x - a1.x) <= 0.5 && Math.abs(a1.x - p.x) <= 0.5
-        if (horiz || vert) { out[out.length - 1] = p; continue }
-      } else if (out.length === 1) {
-        if (Math.hypot(p.x - out[0].x, p.y - out[0].y) <= 0.5) continue
-      }
-      out.push(p)
-    }
-    return out
-  }
-
-  if (!mids?.length && (Math.abs(a.x - b.x) < 0.5 || Math.abs(a.y - b.y) < 0.5)) {
-    return collapse([a, b])
-  }
-
-  if (mids?.length) {
-    const result: Vec2[] = [a]
-    let cur = a
-    for (const t of [...mids, b]) {
-      const dx = t.x - cur.x, dy = t.y - cur.y
-      if (Math.abs(dx) > 0.5 && Math.abs(dy) > 0.5) {
-        if (Math.abs(dx) >= Math.abs(dy)) result.push({ x: t.x, y: cur.y })
-        else result.push({ x: cur.x, y: t.y })
-      }
-      result.push(t)
-      cur = t
-    }
-    return collapse(result)
-  }
-
-  const candidates: Vec2[][] = []
-  {
-    const mx = snapHalf((a.x + b.x) / 2)
-    candidates.push([a, { x: mx, y: a.y }, { x: mx, y: b.y }, b])
-  }
-  {
-    const my = snapHalf((a.y + b.y) / 2)
-    candidates.push([a, { x: a.x, y: my }, { x: b.x, y: my }, b])
-  }
-  if (obstacles?.length) {
-    for (const box of obstacles) {
-      const left = box.x, right = box.x + box.w
-      const top = box.y, bot = box.y + box.h
-      candidates.push([a, { x: a.x, y: top }, { x: b.x, y: top }, b])
-      candidates.push([a, { x: a.x, y: bot }, { x: b.x, y: bot }, b])
-      candidates.push([a, { x: left, y: a.y }, { x: left, y: b.y }, b])
-      candidates.push([a, { x: right, y: a.y }, { x: right, y: b.y }, b])
-    }
-  }
-  candidates.push([a, { x: b.x, y: a.y }, b])
-  candidates.push([a, { x: a.x, y: b.y }, b])
-
-  let best: Vec2[] | null = null
-  let bestLen = Infinity
-  for (const raw of candidates) {
-    const pts = collapse(raw)
-    if (obstacles?.length && pathHitsAny(pts, obstacles)) continue
-    let len = 0
-    for (let i = 0; i < pts.length - 1; i++)
-      len += Math.abs(pts[i + 1].x - pts[i].x) + Math.abs(pts[i + 1].y - pts[i].y)
-    if (len < bestLen) { bestLen = len; best = pts }
-  }
-  return best ?? collapse([a, { x: b.x, y: a.y }, b])
-}
 
 function projectOnSegment(p: Vec2, a: Vec2, b: Vec2) {
   const dx = b.x - a.x, dy = b.y - a.y
@@ -806,21 +696,64 @@ function projectOnSegment(p: Vec2, a: Vec2, b: Vec2) {
   return { point, dist: Math.hypot(p.x - point.x, p.y - point.y), t }
 }
 
-function insertMidAtClick(anchors: Vec2[], existingMids: Vec2[] | undefined, click: Vec2): Vec2[] {
-  const mids = existingMids ? [...existingMids] : []
-  if (anchors.length < 2) return [...mids, click]
-  let bestSeg = 0, bestDist = Infinity, bestPoint = click
-  for (let i = 0; i < anchors.length - 1; i++) {
-    const proj = projectOnSegment(click, anchors[i], anchors[i + 1])
-    if (proj.dist < bestDist) { bestDist = proj.dist; bestSeg = i; bestPoint = proj.point }
+function collapsePolyline(points: Vec2[], epsilon = 0.75): Vec2[] {
+  if (points.length <= 2) return points.map((p) => ({ ...p }))
+  const out: Vec2[] = []
+  for (const p of points) {
+    const last = out[out.length - 1]
+    if (last && Math.hypot(p.x - last.x, p.y - last.y) <= epsilon) continue
+    out.push({ ...p })
+    while (out.length >= 3) {
+      const a = out[out.length - 3]
+      const b = out[out.length - 2]
+      const c = out[out.length - 1]
+      const cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
+      const ab = Math.hypot(b.x - a.x, b.y - a.y)
+      const bc = Math.hypot(c.x - b.x, c.y - b.y)
+      if (Math.abs(cross) <= epsilon * Math.max(1, ab + bc)) out.splice(out.length - 2, 1)
+      else break
+    }
   }
-  const insertIdx = Math.min(bestSeg, mids.length)
-  mids.splice(insertIdx, 0, bestPoint)
-  return mids
+  return out
+}
+
+/**
+ * Build the shortest clean Manhattan tail from the last committed corner to
+ * the current mouse position. The cursor can move freely, but the wire itself
+ * is always horizontal/vertical.
+ */
+function orthogonalPathTo(points: Vec2[], next: Vec2): Vec2[] {
+  if (!points.length) return [{ ...next }]
+
+  const base = collapsePolyline(points)
+  const last = base[base.length - 1]
+  const dx = next.x - last.x
+  const dy = next.y - last.y
+  const epsilon = 0.75
+
+  if (Math.abs(dx) <= epsilon) {
+    return collapsePolyline([...base, { x: last.x, y: next.y }])
+  }
+  if (Math.abs(dy) <= epsilon) {
+    return collapsePolyline([...base, { x: next.x, y: last.y }])
+  }
+
+  // Follow the dominant mouse direction first. This gives the same
+  // predictable one-bend routing used by classic circuit editors.
+  const corner = Math.abs(dx) >= Math.abs(dy)
+    ? { x: next.x, y: last.y }
+    : { x: last.x, y: next.y }
+
+  return collapsePolyline([...base, corner, next])
+}
+
+/** Add a permanent bend/corner at the clicked position. */
+function addOrthogonalAnchor(points: Vec2[], next: Vec2): Vec2[] {
+  return orthogonalPathTo(points, next)
 }
 
 /* ------------------------------------------------------------------
- *  Junction anchors — a junction resolves to a point on its source wire.
+ * Junction anchors — a junction resolves to a point on its source wire.
  * ------------------------------------------------------------------ */
 function anchorOf(
   nodeId: string, pinId: string, side: PinSide,
@@ -832,6 +765,7 @@ function anchorOf(
   if (!n) return null
   return pinAnchor(n, { side, pinId })
 }
+
 function pinAnchor(n: CircuitNode, w: { side: PinSide; pinId: string }): Vec2 | null {
   if (w.side === 'out') {
     const i = n.outputs.findIndex((p) => p.id === w.pinId)
@@ -841,62 +775,15 @@ function pinAnchor(n: CircuitNode, w: { side: PinSide; pinId: string }): Vec2 | 
   return i >= 0 ? leftPinPos(n, i) : null
 }
 
-function wireView(
-  w: Wire, nodes: CircuitNode[], junctions: Junction[],
-): { pts: Vec2[] } | null {
+function wireView(w: Wire, nodes: CircuitNode[], junctions: Junction[]): { pts: Vec2[] } | null {
   const a = anchorOf(w.from.nodeId, w.from.pinId, w.from.side, nodes, junctions)
   const b = anchorOf(w.to.nodeId, w.to.pinId, w.to.side, nodes, junctions)
   if (!a || !b) return null
-  const obstacles = nodes
-    .filter((n) => n.id !== w.from.nodeId && n.id !== w.to.nodeId)
-    .map(inflatedBox)
-  return { pts: orthogonalPath(a, b, w.mids, obstacles) }
-}
-
-/* ------------------------------------------------------------------
- *  Lane solver: guarantee ≥ LANE_SPACING between parallel interior runs.
- *  Endpoints (pin anchors) are never moved — only interior bends.
- * ------------------------------------------------------------------ */
-function applyLaneOffsets(polys: { pts: Vec2[] }[]): void {
-  const usedH: { y: number; x0: number; x1: number }[] = []
-  const usedV: { x: number; y0: number; y1: number }[] = []
-  for (const poly of polys) {
-    const pts = poly.pts
-    for (let i = 0; i < pts.length - 1; i++) {
-      const a = pts[i], b = pts[i + 1]
-      const interior = i > 0 && i < pts.length - 2
-      if (!interior) continue
-      const isH = Math.abs(a.y - b.y) < 0.5 && Math.abs(a.x - b.x) > 0.5
-      const isV = Math.abs(a.x - b.x) < 0.5 && Math.abs(a.y - b.y) > 0.5
-      if (isH) {
-        const x0 = Math.min(a.x, b.x), x1 = Math.max(a.x, b.x)
-        let y = a.y, guard = 0
-        while (guard++ < 10 && usedH.some((u) =>
-          Math.abs(u.y - y) < LANE_SPACING - 1 &&
-          !(x1 < u.x0 - 0.5 || x0 > u.x1 + 0.5))) {
-          y += (guard % 2 === 1 ? 1 : -1) * LANE_SPACING
-        }
-        if (Math.abs(y - a.y) > 0.5) {
-          pts[i] = { x: pts[i].x, y }
-          pts[i + 1] = { x: pts[i + 1].x, y }
-        }
-        usedH.push({ y, x0, x1 })
-      } else if (isV) {
-        const y0 = Math.min(a.y, b.y), y1 = Math.max(a.y, b.y)
-        let x = a.x, guard = 0
-        while (guard++ < 10 && usedV.some((u) =>
-          Math.abs(u.x - x) < LANE_SPACING - 1 &&
-          !(y1 < u.y0 - 0.5 || y0 > u.y1 + 0.5))) {
-          x += (guard % 2 === 1 ? 1 : -1) * LANE_SPACING
-        }
-        if (Math.abs(x - a.x) > 0.5) {
-          pts[i] = { x, y: pts[i].y }
-          pts[i + 1] = { x, y: pts[i + 1].y }
-        }
-        usedV.push({ x, y0, y1 })
-      }
-    }
-  }
+  const stored = w.points?.length ? w.points : [a, b]
+  const pts = stored.map((p) => ({ ...p }))
+  pts[0] = a
+  pts[pts.length - 1] = b
+  return { pts: collapsePolyline(pts) }
 }
 
 function drawBody(
@@ -1165,7 +1052,6 @@ function drawScene(
   ctx: CanvasRenderingContext2D, sw: number, sh: number, dpr: number,
   cam: Camera, nodes: CircuitNode[], wires: Wire[], junctions: Junction[], signal: SignalMap,
   selected: Set<string>, selectedWireId: string | null, selectedWireIds: Set<string>, hoverWireId: string | null,
-  selectedMids: Set<string>,
   chipMeta: Record<string, { color: string }>,
   chipById: Record<string, ChipDefinition>,
   drawingPreview: { fromPos: Vec2; pts: Vec2[] } | null,
@@ -1200,8 +1086,6 @@ function drawScene(
       isSel: selectedWireId === w.id || selectedWireIds.has(w.id),
     })
   }
-  applyLaneOffsets(wirePolys)
-
   type HSeg = { y: number; x0: number; x1: number; high: boolean; hover: boolean; isSel: boolean }
   const hSegs: HSeg[] = []
   for (const { pts, high, hover, isSel } of wirePolys) {
@@ -1217,73 +1101,61 @@ function drawScene(
     }
   }
 
-  // Pass 1 — horizontal segments (deduplicated).
-  const drawnH = new Set<string>()
-  for (const seg of hSegs) {
-    const yKey = Math.round(seg.y)
-    const key = `${yKey}:${Math.round(seg.x0)}:${Math.round(seg.x1)}`
-    if (drawnH.has(key)) continue
-    drawnH.add(key)
-    if (seg.high) {
-      ctx.save(); ctx.strokeStyle = theme.wireHigh + '30'; ctx.lineWidth = 7 / zoom
-      ctx.beginPath(); ctx.moveTo(seg.x0, seg.y); ctx.lineTo(seg.x1, seg.y); ctx.stroke(); ctx.restore()
+  type Seg = { wireId: string; a: Vec2; b: Vec2; high: boolean; hover: boolean; isSel: boolean }
+  const segments: Seg[] = []
+  for (const { w, pts, high, hover, isSel } of wirePolys) {
+    for (let i = 0; i < pts.length - 1; i++) {
+      segments.push({ wireId: w.id, a: pts[i], b: pts[i + 1], high, hover, isSel })
     }
+  }
+
+  const strokeSeg = (seg: Seg) => {
+    const a = seg.a, b = seg.b
     ctx.strokeStyle = seg.isSel ? theme.sel : seg.hover ? theme.wireHover : seg.high ? theme.wireHigh : theme.wireLow
     ctx.lineWidth = seg.isSel ? clamp(3 / zoom, 1.6, 3.4) : clamp(2.1 / zoom, 1.2, 2.6)
     if (seg.hover || seg.isSel) ctx.setLineDash([5 / zoom, 3 / zoom])
-    ctx.beginPath(); ctx.moveTo(seg.x0, seg.y); ctx.lineTo(seg.x1, seg.y); ctx.stroke()
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke()
     ctx.setLineDash([])
   }
 
-  // Pass 2 — vertical segments with exactly ONE jumper per unique crossing Y.
-  for (const { pts, high, hover, isSel } of wirePolys) {
-    for (let i = 0; i < pts.length - 1; i++) {
-      const p0 = pts[i], p1 = pts[i + 1]
-      if (Math.abs(p0.x - p1.x) > 0.5) continue
-      const x = p0.x
-      const yMin = Math.min(p0.y, p1.y), yMax = Math.max(p0.y, p1.y)
-
-      const crossSet = new Map<number, number>()
-      for (const seg of hSegs) {
-        if (seg.y <= yMin + 1 || seg.y >= yMax - 1) continue
-        if (x < seg.x0 - 0.5 || x > seg.x1 + 0.5) continue
-        const rk = Math.round(seg.y)
-        if (!crossSet.has(rk)) crossSet.set(rk, seg.y)
-      }
-      const crosses = Array.from(crossSet.values()).sort((a, b) => a - b)
-
-      const goingDown = p1.y > p0.y
-      let cy = p0.y
-      const rJump = 6 / zoom
-      ctx.strokeStyle = isSel ? theme.sel : hover ? theme.wireHover : high ? theme.wireHigh : theme.wireLow
-      ctx.lineWidth = isSel ? clamp(3 / zoom, 1.6, 3.4) : clamp(2.1 / zoom, 1.2, 2.6)
-      if (hover || isSel) ctx.setLineDash([5 / zoom, 3 / zoom])
-      for (const hy of crosses) {
-        const pre = goingDown ? hy - rJump : hy + rJump
-        ctx.beginPath(); ctx.moveTo(x, cy); ctx.lineTo(x, pre); ctx.stroke()
-        ctx.beginPath()
-        ctx.arc(x, hy, rJump, goingDown ? -Math.PI / 2 : Math.PI / 2, goingDown ? Math.PI / 2 : -Math.PI / 2, false)
-        ctx.stroke()
-        cy = goingDown ? hy + rJump : hy - rJump
-      }
-      ctx.beginPath(); ctx.moveTo(x, cy); ctx.lineTo(x, p1.y); ctx.stroke()
-      ctx.setLineDash([])
+  // Draw every path once. A high-signal glow is kept underneath the main stroke.
+  for (const seg of segments) {
+    if (seg.high) {
+      ctx.save(); ctx.strokeStyle = theme.wireHigh + '30'; ctx.lineWidth = 7 / zoom
+      ctx.beginPath(); ctx.moveTo(seg.a.x, seg.a.y); ctx.lineTo(seg.b.x, seg.b.y); ctx.stroke(); ctx.restore()
     }
+    strokeSeg(seg)
   }
 
-  // Waypoint handles
-  for (const { w, isSel } of wirePolys) {
-    if (!w.mids) continue
-    w.mids.forEach((m, i) => {
-      const midSel = selectedMids.has(`${w.id}:${i}`)
-      const r = (midSel ? 6 : 4.5) / zoom
-      ctx.beginPath(); ctx.arc(m.x, m.y, r, 0, Math.PI * 2)
-      ctx.fillStyle = midSel ? theme.sel : theme.body
-      ctx.fill()
-      ctx.lineWidth = 1.4 / zoom
-      ctx.strokeStyle = midSel ? theme.sel : (isSel ? theme.sel : theme.wireHover)
-      ctx.stroke()
-    })
+  // Crossing bridges: only unrelated horizontal/vertical wires get a bridge.
+  // A junction at the intersection explicitly disables the bridge and represents
+  // an intentional electrical connection instead.
+  const hasJunctionAt = (p: Vec2) => junctions.some((j) => Math.hypot(j.point.x - p.x, j.point.y - p.y) <= 1.5)
+  const drawnCrossings = new Set<string>()
+  for (const v of segments) {
+    const vIsVertical = Math.abs(v.a.x - v.b.x) <= 0.5 && Math.abs(v.a.y - v.b.y) > 0.5
+    if (!vIsVertical) continue
+    const vx = v.a.x
+    const vy0 = Math.min(v.a.y, v.b.y), vy1 = Math.max(v.a.y, v.b.y)
+    for (const h of segments) {
+      if (h.wireId === v.wireId) continue
+      const hIsHorizontal = Math.abs(h.a.y - h.b.y) <= 0.5 && Math.abs(h.a.x - h.b.x) > 0.5
+      if (!hIsHorizontal) continue
+      const hy = h.a.y
+      const hx0 = Math.min(h.a.x, h.b.x), hx1 = Math.max(h.a.x, h.b.x)
+      if (vx < hx0 - 0.5 || vx > hx1 + 0.5 || hy < vy0 - 0.5 || hy > vy1 + 0.5) continue
+      const crossing = { x: vx, y: hy }
+      const crossingKey = `${Math.round(vx * 2) / 2}:${Math.round(hy * 2) / 2}`
+      if (drawnCrossings.has(crossingKey) || hasJunctionAt(crossing)) continue
+      drawnCrossings.add(crossingKey)
+      const r = 6 / zoom
+      const color = v.isSel ? theme.sel : v.hover ? theme.wireHover : v.high ? theme.wireHigh : theme.wireLow
+      ctx.strokeStyle = color
+      ctx.lineWidth = v.isSel ? clamp(3 / zoom, 1.6, 3.4) : clamp(2.1 / zoom, 1.2, 2.6)
+      ctx.beginPath(); ctx.moveTo(vx, hy - r); ctx.lineTo(vx, hy - r / 2); ctx.stroke()
+      ctx.beginPath(); ctx.arc(vx, hy, r, Math.PI, 0, false); ctx.stroke()
+      ctx.beginPath(); ctx.moveTo(vx, hy + r); ctx.lineTo(vx, hy + r / 2); ctx.stroke()
+    }
   }
 
   // Junction dots
@@ -1321,16 +1193,8 @@ function drawScene(
     ctx.stroke()
     ctx.setLineDash([])
     const end = drawingPreview.pts[drawingPreview.pts.length - 1]
-    ctx.beginPath(); ctx.arc(end.x, end.y, 4 / zoom, 0, Math.PI * 2)
+    ctx.beginPath(); ctx.arc(end.x, end.y, 3.5 / zoom, 0, Math.PI * 2)
     ctx.fillStyle = theme.wireHigh; ctx.fill()
-    // anchored waypoints
-    for (let i = 1; i < drawingPreview.pts.length - 1; i++) {
-      const p = drawingPreview.pts[i]
-      ctx.beginPath(); ctx.arc(p.x, p.y, 3.2 / zoom, 0, Math.PI * 2)
-      ctx.fillStyle = theme.body; ctx.fill()
-      ctx.lineWidth = 1.3 / zoom
-      ctx.strokeStyle = theme.wireHigh; ctx.stroke()
-    }
   }
 
   if (placingNode) {
@@ -1377,7 +1241,7 @@ function renderNodesToImage(
   const ctx = canvas.getContext('2d')!
   const cam: Camera = { zoom: 1, offsetX: -minX + padding, offsetY: -minY + padding }
   drawScene(
-    ctx, w, h, scale, cam, nodes, wires, [], {}, new Set(), null, new Set(), null, new Set(),
+    ctx, w, h, scale, cam, nodes, wires, [], {}, new Set(), null, new Set(), null,
     chipMeta, {}, null, null, null, theme, dark,
   )
   return { dataUrl: canvas.toDataURL('image/png'), width: w, height: h }
@@ -1405,7 +1269,6 @@ function saveState(s: SavedState) {
 type DragMode =
   | { kind: 'move'; ids: string[]; startWorld: Vec2; origin: Map<string, Vec2> }
   | { kind: 'box'; startX: number; startY: number; endX: number; endY: number }
-  | { kind: 'wireMid'; startWorld: Vec2; origins: Map<string, Vec2> }
   | null
 
 export default function LogicMaker() {
@@ -1430,7 +1293,6 @@ export default function LogicMaker() {
   const [history, setHistory] = useState<HistoryEntry[]>([])
   const [redoStack, setRedoStack] = useState<HistoryEntry[]>([])
   const [clipboard, setClipboard] = useState<{ nodes: CircuitNode[]; wires: Wire[] } | null>(null)
-  const [selectedMids, setSelectedMids] = useState<Set<string>>(new Set())
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null)
   const [paletteCtxMenu, setPaletteCtxMenu] = useState<{ x: number; y: number; placement: Placement } | null>(null)
   const [dark, setDark] = useState(saved.dark ?? false)
@@ -1449,9 +1311,9 @@ export default function LogicMaker() {
   const modalOpen = useRef(false)
   const buttonHeld = useRef<string | null>(null)
 
-  const live = useRef({ nodes, wires, junctions, chips, selected, selectedWireId, selectedWireIds, placement, camera, selectedMids })
+  const live = useRef({ nodes, wires, junctions, chips, selected, selectedWireId, selectedWireIds, placement, camera })
   useEffect(() => {
-    live.current = { nodes, wires, junctions, chips, selected, selectedWireId, selectedWireIds, placement, camera, selectedMids }
+    live.current = { nodes, wires, junctions, chips, selected, selectedWireId, selectedWireIds, placement, camera }
   })
   useEffect(() => {
     modalOpen.current = !!(createModal || clockModal || renamePinModal || changeBlockModal)
@@ -1513,7 +1375,7 @@ export default function LogicMaker() {
     })),
     wires: live.current.wires.map((w) => ({
       ...w, from: { ...w.from }, to: { ...w.to },
-      mids: w.mids?.map((m) => ({ ...m })),
+      points: w.points?.map((m) => ({ ...m })),
     })),
     junctions: live.current.junctions.map((j) => ({ ...j, point: { ...j.point } })),
   }), [])
@@ -1532,7 +1394,7 @@ export default function LogicMaker() {
       const prev = h[h.length - 1]
       setRedoStack((r) => [...r, snapshotCurrent()].slice(-80))
       setNodes(prev.nodes); setWires(prev.wires); setJunctions(prev.junctions)
-      setSelected(new Set()); setSelectedWireId(null); setSelectedWireIds(new Set()); setSelectedMids(new Set())
+      setSelected(new Set()); setSelectedWireId(null); setSelectedWireIds(new Set())
       return h.slice(0, -1)
     })
   }, [snapshotCurrent])
@@ -1543,7 +1405,7 @@ export default function LogicMaker() {
       const next = r[r.length - 1]
       setHistory((h) => [...h, snapshotCurrent()].slice(-80))
       setNodes(next.nodes); setWires(next.wires); setJunctions(next.junctions)
-      setSelected(new Set()); setSelectedWireId(null); setSelectedWireIds(new Set()); setSelectedMids(new Set())
+      setSelected(new Set()); setSelectedWireId(null); setSelectedWireIds(new Set())
       return r.slice(0, -1)
     })
   }, [snapshotCurrent])
@@ -1571,17 +1433,6 @@ export default function LogicMaker() {
   const findNodeAt = (p: Vec2) => {
     for (let i = live.current.nodes.length - 1; i >= 0; i--)
       if (hitNode(live.current.nodes[i], p)) return live.current.nodes[i]
-    return null
-  }
-  const findMidAt = (p: Vec2): { wireId: string; midIndex: number } | null => {
-    const grab = 12 / live.current.camera.zoom
-    for (const w of live.current.wires) {
-      if (!w.mids) continue
-      for (let i = 0; i < w.mids.length; i++) {
-        const d = Math.hypot(p.x - w.mids[i].x, p.y - w.mids[i].y)
-        if (d < grab) return { wireId: w.id, midIndex: i }
-      }
-    }
     return null
   }
   const findHoveredWire = (p: Vec2) => {
@@ -1677,65 +1528,46 @@ export default function LogicMaker() {
     setPaletteCtxMenu(null)
   }
 
-  /* ---------------- interactive point-to-point drawing ---------------- */
+  /* ---------------- interactive orthogonal wire drawing ---------------- */
 
   const startDrawing = (pin: EnumeratedPin) => {
     drawing.current = {
       from: { nodeId: pin.nodeId, pinId: pin.pinId, side: pin.side },
-      fromPos: pin.pos,
-      waypoints: [],
-      orientation: 'h',
+      fromPos: { ...pin.pos },
+      points: [{ ...pin.pos }],
     }
+    mousePos.current = { ...pin.pos }
     setSelected(new Set())
     setSelectedWireId(null)
     setSelectedWireIds(new Set())
-    setSelectedMids(new Set())
-  }
-
-  const currentDrawEnd = (): Vec2 => {
-    const d = drawing.current!
-    const last = d.waypoints.length ? d.waypoints[d.waypoints.length - 1] : d.fromPos
-    const cur = mousePos.current
-    return d.orientation === 'h' ? { x: cur.x, y: last.y } : { x: last.x, y: cur.y }
-  }
-
-  const anchorWaypoint = () => {
-    const d = drawing.current!
-    d.waypoints.push(currentDrawEnd())
-    d.orientation = d.orientation === 'h' ? 'v' : 'h'
   }
 
   const cancelDrawing = () => { drawing.current = null }
 
-  const finishDrawing = (nodeId: string, pinId: string, side: PinSide) => {
+  const finishDrawing = (nodeId: string, pinId: string, side: PinSide, endPoint?: Vec2) => {
     const d = drawing.current
     if (!d) return
     let a = d.from
     let b: PinRef = { nodeId, pinId, side }
     if (a.side === 'in' && b.side === 'out') { const t = a; a = b; b = t }
-    if (a.side !== 'out' || b.side !== 'in') { cancelDrawing(); return }
-    if (a.nodeId === b.nodeId) { cancelDrawing(); return }
+    if (a.side !== 'out' || b.side !== 'in' || a.nodeId === b.nodeId) { cancelDrawing(); return }
 
-    const targetPos = anchorOf(b.nodeId, b.pinId, b.side, live.current.nodes, live.current.junctions)
-    const last = d.waypoints.length ? d.waypoints[d.waypoints.length - 1] : d.fromPos
-    const mids = [...d.waypoints]
-    if (targetPos) {
-      if (d.orientation === 'h' && Math.abs(targetPos.y - last.y) > 0.5) {
-        mids.push({ x: targetPos.x, y: last.y })
-      } else if (d.orientation === 'v' && Math.abs(targetPos.x - last.x) > 0.5) {
-        mids.push({ x: last.x, y: targetPos.y })
-      }
-    }
+    const targetPos = endPoint ?? anchorOf(b.nodeId, b.pinId, b.side, live.current.nodes, live.current.junctions)
+    if (!targetPos) { cancelDrawing(); return }
+    let points = orthogonalPathTo(d.points, targetPos)
+    points[0] = { ...d.fromPos }
+    points[points.length - 1] = { ...targetPos }
+    points = collapsePolyline(points)
 
     pushHistory()
     setWires((ws) => [
       ...ws.filter((w) => !(w.to.side === 'in' && isPinRefEqual(w.to, b))),
-      createWire(a, b, mids),
+      createWire(a, b, points),
     ])
     cancelDrawing()
   }
 
-  /** Create a junction on an existing wire and return it (with the projected point). */
+  /** Create a permanent junction on an existing wire and return it. */
   const createJunctionOnWire = (wireId: string, p: Vec2): Junction | null => {
     const pt = projectOnWire(wireId, p)
     if (!pt) return null
@@ -1775,16 +1607,18 @@ export default function LogicMaker() {
       const d = drawing.current
       const pinHit = findPinAt(p)
       if (pinHit && pinHit.nodeId !== d.from.nodeId) {
-        finishDrawing(pinHit.nodeId, pinHit.pinId, pinHit.side)
+        finishDrawing(pinHit.nodeId, pinHit.pinId, pinHit.side, pinHit.pos)
         return
       }
       const wireHitId = findHoveredWire(p)
       if (wireHitId) {
-        const j = createJunctionOnWire(wireHitId, p)
-        if (j) { finishDrawing(j.id, 'j', 'in'); return }
+        const pt = projectOnWire(wireHitId, p)
+        const j = pt ? createJunctionOnWire(wireHitId, pt) : null
+        if (j) { finishDrawing(j.id, 'j', 'in', j.point); return }
       }
-      // Anchor a waypoint and flip orientation.
-      anchorWaypoint()
+      // Empty clicks commit a clean 90-degree bend. The live tail continues
+      // following the mouse without adding noisy trace points.
+      d.points = addOrthogonalAnchor(d.points, p)
       return
     }
 
@@ -1833,70 +1667,32 @@ export default function LogicMaker() {
       setSelected(next)
       setSelectedWireId(null)
       setSelectedWireIds(new Set())
-      setSelectedMids(new Set())
       const origin = new Map<string, Vec2>()
       for (const n of live.current.nodes) if (next.has(n.id)) origin.set(n.id, { ...n.position })
       drag.current = { kind: 'move', ids: Array.from(next), startWorld: p, origin }
       return
     }
 
-    const mid = findMidAt(p)
-    if (mid) {
-      const key = `${mid.wireId}:${mid.midIndex}`
-      setSelected(new Set())
-      setSelectedWireId(null)
-      setSelectedWireIds(new Set())
-      let nextMids: Set<string>
-      if (e.shiftKey) {
-        nextMids = new Set(selectedMids)
-        if (nextMids.has(key)) nextMids.delete(key)
-        else nextMids.add(key)
-      } else if (selectedMids.has(key) && selectedMids.size > 1) {
-        nextMids = selectedMids
-      } else {
-        nextMids = new Set([key])
-      }
-      setSelectedMids(nextMids)
-      const origins = new Map<string, Vec2>()
-      for (const w of live.current.wires) {
-        if (!w.mids) continue
-        w.mids.forEach((m, i) => {
-          const k = `${w.id}:${i}`
-          if (nextMids.has(k)) origins.set(k, { ...m })
-        })
-      }
-      drag.current = { kind: 'wireMid', startWorld: p, origins }
-      return
-    }
-
     const hw = findHoveredWire(p)
-    if (hw && e.detail >= 2) {
-      pushHistory()
-      setWires((ws) => ws.map((w) => {
-        if (w.id !== hw) return w
-        const vw = wireView(w, live.current.nodes, live.current.junctions)
-        if (!vw) return w
-        const mids = insertMidAtClick(vw.pts, w.mids, p)
-        return { ...w, mids }
-      }))
-      setSelectedWireId(hw)
-      setSelectedWireIds(new Set())
-      setSelected(new Set())
-      setSelectedMids(new Set())
-      return
-    }
     if (hw) {
+      const j = createJunctionOnWire(hw, p)
+      if (j) {
+        const pseudoPin: EnumeratedPin = {
+          nodeId: j.id, pinId: 'out', side: 'out', index: 0, pos: j.point,
+          node: { id: j.id, kind: 'INPUT', label: '', position: j.point, inputs: [], outputs: [{ id: 'out', name: 'OUT' }] },
+        }
+        startDrawing(pseudoPin)
+        return
+      }
       setSelectedWireId(hw)
       setSelectedWireIds(new Set())
       setSelected(new Set())
-      setSelectedMids(new Set())
       return
     }
 
     setSelected(new Set())
     setSelectedWireId(null)
     setSelectedWireIds(new Set())
-    setSelectedMids(new Set())
     drag.current = { kind: 'box', startX: p.x, startY: p.y, endX: p.x, endY: p.y }
   }
 
@@ -1915,28 +1711,14 @@ export default function LogicMaker() {
     const p = screenToWorld(sx, sy)
     mousePos.current = p
 
-    if (drawing.current) return  // RAF loop draws the live preview from mousePos
+    if (drawing.current) {
+      // The current cursor position is rendered as a live orthogonal tail;
+      // only explicit clicks become permanent corners.
+      return
+    }
 
     if (drag.current?.kind === 'box') { drag.current.endX = p.x; drag.current.endY = p.y }
-    else if (drag.current?.kind === 'wireMid') {
-      const d = drag.current
-      const dx = p.x - d.startWorld.x
-      const dy = p.y - d.startWorld.y
-      const nextWires = live.current.wires.map((w) => {
-        if (!w.mids) return w
-        let changed = false
-        const mids = w.mids.map((m, i) => {
-          const k = `${w.id}:${i}`
-          const origin = d.origins.get(k)
-          if (!origin) return m
-          changed = true
-          return { x: origin.x + dx, y: origin.y + dy }
-        })
-        return changed ? { ...w, mids } : w
-      })
-      live.current.wires = nextWires
-      setWires(nextWires)
-    } else if (drag.current?.kind === 'move') {
+    else if (drag.current?.kind === 'move') {
       const d = drag.current, dx = p.x - d.startWorld.x, dy = p.y - d.startWorld.y
       const idSet = new Set(d.ids)
       const nextNodes = live.current.nodes.map((n) => idSet.has(n.id)
@@ -1955,18 +1737,14 @@ export default function LogicMaker() {
       buttonHeld.current = null
       setNodes((ns) => ns.map((n) => n.id === id ? { ...n, value: false } : n))
     }
-
     if (pan.current) {
       pan.current = null
       if (canvasRef.current) canvasRef.current.style.cursor = spaceDown.current ? 'grab' : 'default'
       return
     }
-    // Drawing session commits on pointerdown; ignore the up.
     if (drawing.current) return
 
-    const p = posFromEvent(e)
     const d = drag.current
-
     if (d?.kind === 'box') {
       const minX = Math.min(d.startX, d.endX), maxX = Math.max(d.startX, d.endX)
       const minY = Math.min(d.startY, d.endY), maxY = Math.max(d.startY, d.endY)
@@ -1976,16 +1754,6 @@ export default function LogicMaker() {
         if (b.x < maxX && b.x + b.w > minX && b.y < maxY && b.y + b.h > minY) next.add(n.id)
       }
       setSelected(next)
-      const midKeys = new Set<string>()
-      for (const w of live.current.wires) {
-        if (!w.mids) continue
-        w.mids.forEach((m, i) => {
-          if (m.x >= minX && m.x <= maxX && m.y >= minY && m.y <= maxY) {
-            midKeys.add(`${w.id}:${i}`)
-          }
-        })
-      }
-      setSelectedMids(midKeys)
       const wireIds = new Set<string>()
       for (const w of live.current.wires) {
         const vw = wireView(w, live.current.nodes, live.current.junctions)
@@ -1994,9 +1762,7 @@ export default function LogicMaker() {
         if (inside) wireIds.add(w.id)
       }
       setSelectedWireIds(wireIds)
-      if (midKeys.size || wireIds.size) setSelectedWireId(null)
-    } else if (d?.kind === 'wireMid') {
-      pushHistory()
+      if (wireIds.size) setSelectedWireId(null)
     } else if (d?.kind === 'move') {
       const idSet = new Set(d.ids)
       setNodes((ns) => ns.map((n) => idSet.has(n.id)
@@ -2005,24 +1771,13 @@ export default function LogicMaker() {
     drag.current = null
   }
 
-  /** Delete every currently-selected item in a single action. */
   const deleteSelection = () => {
-    const mids = live.current.selectedMids
     const boxWires = live.current.selectedWireIds
     const wireId = live.current.selectedWireId
     const ids = live.current.selected
-    if (!mids.size && !boxWires.size && !wireId && !ids.size) return
+    if (!boxWires.size && !wireId && !ids.size) return
 
     pushHistory()
-
-    if (mids.size > 0) {
-      setWires((ws) => ws.map((w) => {
-        if (!w.mids) return w
-        const keep = w.mids.filter((_, i) => !mids.has(`${w.id}:${i}`))
-        return { ...w, mids: keep.length ? keep : undefined }
-      }))
-    }
-
     const wiresToDelete = new Set(boxWires)
     if (wireId) wiresToDelete.add(wireId)
 
@@ -2037,7 +1792,6 @@ export default function LogicMaker() {
     setSelected(new Set())
     setSelectedWireId(null)
     setSelectedWireIds(new Set())
-    setSelectedMids(new Set())
   }
 
   const copySelection = () => {
@@ -2056,7 +1810,7 @@ export default function LogicMaker() {
           ...w,
           from: { ...w.from },
           to: { ...w.to },
-          mids: w.mids?.map((m) => ({ ...m })),
+          points: w.points?.map((m) => ({ ...m })),
         })),
     })
   }
@@ -2085,14 +1839,13 @@ export default function LogicMaker() {
       id: uid('w'),
       from: { ...w.from, nodeId: idMap.get(w.from.nodeId)! },
       to: { ...w.to, nodeId: idMap.get(w.to.nodeId)! },
-      mids: w.mids?.map((m) => ({ x: m.x + offset, y: m.y + offset })),
+      points: w.points?.map((m) => ({ x: m.x + offset, y: m.y + offset })),
     }))
     setNodes((ns) => [...ns, ...newNodes])
     setWires((ws) => [...ws, ...newWires])
     setSelected(new Set(newNodes.map((n) => n.id)))
     setSelectedWireId(null)
     setSelectedWireIds(new Set())
-    setSelectedMids(new Set())
   }
 
   const openCreateModal = () => {
@@ -2135,10 +1888,10 @@ export default function LogicMaker() {
     // Same placement formula used by computeUnfoldedLayout
     const offX = node.position.x + (w - (maxX - minX)) / 2 - minX
     const offY = node.position.y + header + (h - header - (maxY - minY)) / 2 - minY
-    const byId = new Map(chip.nodes.map((cn) => [cn.id, {
+    const byId = new Map<string, CircuitNode>(chip.nodes.map((cn) => [cn.id, {
       ...cn,
       position: { x: cn.position.x + offX, y: cn.position.y + offY },
-    }]))
+    } as CircuitNode]))
 
     const inPins: Vec2[] = chip.inputNodeIds.map((id) => {
       const cn = byId.get(id)
@@ -2379,23 +2132,6 @@ export default function LogicMaker() {
   const onDoubleClick = (e: React.MouseEvent) => {
     if (placement || drawing.current) return
     const p = screenToWorld(e.clientX - canvasRect().left, e.clientY - canvasRect().top)
-    if (findMidAt(p)) return
-    const hw = findHoveredWire(p)
-    if (hw) {
-      pushHistory()
-      setWires((ws) => ws.map((w) => {
-        if (w.id !== hw) return w
-        const vw = wireView(w, live.current.nodes, live.current.junctions)
-        if (!vw) return w
-        const mids = insertMidAtClick(vw.pts, w.mids, p)
-        return { ...w, mids }
-      }))
-      setSelectedWireId(hw)
-      setSelectedWireIds(new Set())
-      setSelected(new Set())
-      setSelectedMids(new Set())
-      return
-    }
     const pin = findPinAt(p)
     if (pin) {
       const n = pin.node
@@ -2434,18 +2170,10 @@ export default function LogicMaker() {
     const p = posFromEvent(e)
     const node = findNodeAt(p)
     const wireId = findHoveredWire(p)
-    const midHit = findMidAt(p)
-
     let target: ContextMenuState['target'] = 'canvas'
-    let nodeId: string | undefined, wId: string | undefined, waypointIndex: number | undefined
+    let nodeId: string | undefined, wId: string | undefined
 
-    if (midHit) {
-      target = 'waypoint'
-      wId = midHit.wireId
-      waypointIndex = midHit.midIndex
-      setSelectedWireId(midHit.wireId); setSelected(new Set()); setSelectedWireIds(new Set())
-      setSelectedMids(new Set([`${midHit.wireId}:${midHit.midIndex}`]))
-    } else if (node) {
+    if (node) {
       if (node.kind === 'CHIP' && node.chipId && !chipsById[node.chipId]?.builtin) {
         target = node.unfolded ? 'unfoldedChip' : 'chip'
       } else {
@@ -2459,7 +2187,7 @@ export default function LogicMaker() {
       target = 'wire'; wId = wireId
       setSelectedWireId(wireId); setSelected(new Set()); setSelectedWireIds(new Set())
     }
-    setCtxMenu({ x: e.clientX, y: e.clientY, world: p, target, nodeId, wireId: wId, waypointIndex })
+    setCtxMenu({ x: e.clientX, y: e.clientY, world: p, target, nodeId, wireId: wId })
   }
 
   const ctxAction = (action: string) => {
@@ -2479,15 +2207,6 @@ export default function LogicMaker() {
       } else {
         deleteSelection()
       }
-    } else if (action === 'deleteWaypoint' && wireId != null && ctxMenu.waypointIndex != null) {
-      pushHistory()
-      const idx = ctxMenu.waypointIndex
-      setWires((ws) => ws.map((w) => {
-        if (w.id !== wireId || !w.mids) return w
-        const keep = w.mids.filter((_, i) => i !== idx)
-        return { ...w, mids: keep.length ? keep : undefined }
-      }))
-      setSelectedMids(new Set())
     } else if (action === 'edit' && nodeId) {
       const n = nodes.find((x) => x.id === nodeId)
       if (n?.chipId) enterEditChip(n.chipId)
@@ -2509,18 +2228,6 @@ export default function LogicMaker() {
     } else if (action === 'clockSettings' && nodeId) {
       const n = nodes.find((x) => x.id === nodeId)
       if (n) setClockModal({ id: nodeId, period: n.period ?? 30 })
-    } else if (action === 'addPoint' && wireId) {
-      pushHistory()
-      const pt = ctxMenu.world
-      setWires((ws) => ws.map((x) => {
-        if (x.id !== wireId) return x
-        const vw = wireView(x, live.current.nodes, live.current.junctions)
-        if (!vw) return { ...x, mids: [...(x.mids ?? []), pt] }
-        return { ...x, mids: insertMidAtClick(vw.pts, x.mids, pt) }
-      }))
-    } else if (action === 'clearMids' && wireId) {
-      pushHistory()
-      setWires((ws) => ws.map((w) => w.id === wireId ? { ...w, mids: undefined } : w))
     } else if (action === 'rename' && nodeId) {
       const n = nodes.find((x) => x.id === nodeId)
       if (!n) return
@@ -2627,13 +2334,12 @@ export default function LogicMaker() {
         drawing.current = null
         setPlacement(null); setCreateModal(false)
         setClockModal(null); setRenamePinModal(null); setChangeBlockModal(null); setCtxMenu(null); setPaletteCtxMenu(null)
-        setSelected(new Set()); setSelectedWireId(null); setSelectedWireIds(new Set()); setSelectedMids(new Set())
+        setSelected(new Set()); setSelectedWireId(null); setSelectedWireIds(new Set())
       }
       if ((e.key === 'Delete' || e.key === 'Backspace')
         && (live.current.selected.size > 0
           || live.current.selectedWireId
-          || live.current.selectedWireIds.size > 0
-          || live.current.selectedMids.size > 0)) {
+          || live.current.selectedWireIds.size > 0)) {
         e.preventDefault()
         actionsRef.current.deleteSelection()
       }
@@ -2692,11 +2398,7 @@ export default function LogicMaker() {
       let drawingPreview: { fromPos: Vec2; pts: Vec2[] } | null = null
       if (drawing.current) {
         const d = drawing.current
-        const pts = [d.fromPos, ...d.waypoints]
-        const last = pts[pts.length - 1]
-        const cur = mousePos.current
-        const end = d.orientation === 'h' ? { x: cur.x, y: last.y } : { x: last.x, y: cur.y }
-        pts.push(end)
+        const pts = orthogonalPathTo(d.points, mousePos.current)
         drawingPreview = { fromPos: d.fromPos, pts }
       }
 
@@ -2726,7 +2428,7 @@ export default function LogicMaker() {
       }
 
       drawScene(ctx, cw, ch, dpr, s.camera, s.nodes, s.wires, s.junctions, signal.current,
-        s.selected, s.selectedWireId, s.selectedWireIds, hoverWire.current, s.selectedMids,
+        s.selected, s.selectedWireId, s.selectedWireIds, hoverWire.current,
         chipMeta, chipById, drawingPreview, box, placingNode, theme, dark)
     }
     loop()
@@ -2809,9 +2511,6 @@ export default function LogicMaker() {
           onPointerUp={onPointerUp} onPointerCancel={onPointerUp}
           onDoubleClick={onDoubleClick} onContextMenu={onContextMenu}
         />
-        <div className={`pointer-events-none absolute bottom-3 left-3 rounded-md px-2.5 py-1 text-[11px] ${dark ? 'bg-slate-800/80 text-slate-300' : 'bg-white/80 text-slate-600'}`}>
-          Drag from a pin → click to anchor a bend → click a pin to finish · Click a wire to branch (junction) · Esc cancels
-        </div>
       </main>
 
       <footer className={`z-20 flex shrink-0 items-stretch gap-4 overflow-x-auto border-t px-3 py-2 ${dark ? 'border-slate-700 bg-slate-800' : 'border-slate-200 bg-white'}`}>
@@ -2924,28 +2623,11 @@ export default function LogicMaker() {
       {ctxMenu && (
         <div
           className={`fixed z-50 overflow-hidden rounded-lg border py-1 shadow-xl ${dark ? 'border-slate-600 bg-slate-800' : 'border-slate-200 bg-white'}`}
-          style={clampMenuPos(ctxMenu.x, ctxMenu.y, 240, ctxMenu.target === 'waypoint' ? 80 : 360)}
+          style={clampMenuPos(ctxMenu.x, ctxMenu.y, 240, 360)}
           onMouseLeave={() => setCtxMenu(null)}
         >
-          {ctxMenu.target === 'waypoint' ? (
+          {ctxMenu.target === 'wire' ? (
             <>
-              <button className={menuItemCls} onClick={() => ctxAction('deleteWaypoint')}>
-                <Trash2 size={14} /> Delete waypoint
-              </button>
-              <div className={`my-1 border-t ${dark ? 'border-slate-600' : 'border-slate-100'}`} />
-              <button className={menuItemCls} onClick={() => ctxAction('clearMids')}>
-                Clear all waypoints
-              </button>
-            </>
-          ) : ctxMenu.target === 'wire' ? (
-            <>
-              <button className={menuItemCls} onClick={() => ctxAction('addPoint')}>
-                <Pencil size={14} /> Add waypoint
-              </button>
-              <button className={menuItemCls} onClick={() => ctxAction('clearMids')}>
-                Clear waypoints
-              </button>
-              <div className={`my-1 border-t ${dark ? 'border-slate-600' : 'border-slate-100'}`} />
               <button className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-red-500 hover:bg-red-50"
                 onClick={() => ctxAction('delete')}>
                 <Trash2 size={14} /> Delete wire
