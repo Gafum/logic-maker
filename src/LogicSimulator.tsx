@@ -30,7 +30,7 @@ import {
 } from 'lucide-react'
 
 /* =====================================================================
- *  LogicMaker — refactored (interactive P2P wires, junctions, compact menus)
+ *  LogicMaker — refactored (grid-aligned, universal nets, clean bridges)
  * ===================================================================== */
 
 type PinSide = 'in' | 'out'
@@ -56,8 +56,7 @@ interface CircuitNode {
   rotation?: 0 | 90 | 180 | 270
   unfolded?: boolean
   unfoldedSize?: { w: number; h: number }
-  /** Absolute-inner-pin offsets relative to node.position, populated on unfold.
-   *  Used so external wires land exactly on the internal pins (no gaps). */
+  /** Absolute-inner-pin offsets relative to node.position, populated on unfold. */
   unfoldedPinPos?: { in: Vec2[]; out: Vec2[] }
 }
 interface Wire {
@@ -113,15 +112,8 @@ interface ContextMenuState {
 interface DrawSession {
   from: PinRef
   fromPos: Vec2
-  /** Committed orthogonal path. The current mouse position is preview-only. */
   points: Vec2[]
-  /** Last snapped cursor position, used to distinguish backtracking from a stationary move. */
   cursor: Vec2
-  /**
-   * Sticky bend preference for the free leading segment.
-   * null = not yet established (first significant movement after a lock chooses it).
-   * Once set, the free L-shape keeps this orientation so the path never flips.
-   */
   preferH: boolean | null
 }
 
@@ -153,7 +145,8 @@ function approxLabelWidth(label: string): number {
 const nodeRows = (n: CircuitNode) => Math.max(n.inputs.length, n.outputs.length, 1)
 const nodeHeight = (n: CircuitNode) => {
   if (n.kind === 'CHIP' && n.unfolded && n.unfoldedSize) return n.unfoldedSize.h
-  return NODE_PAD * 2 + PIN_SPACING * Math.max(nodeRows(n) - 1, 0) + PIN_SPACING
+  const raw = NODE_PAD * 2 + PIN_SPACING * Math.max(nodeRows(n) - 1, 0) + PIN_SPACING
+  return snap(raw)
 }
 const nodeWidth = (n: CircuitNode) => {
   if (n.kind === 'CHIP' && n.unfolded && n.unfoldedSize) return n.unfoldedSize.w
@@ -170,14 +163,14 @@ const nodeWidth = (n: CircuitNode) => {
   const btnReserve =
     n.kind === 'INPUT' || n.kind === 'BUTTON' || n.kind === 'CLOCK' ? 60 : 0
   const outReserve = n.kind === 'OUTPUT' ? 28 : 0
-  return Math.max(NODE_W_MIN, fromLabel + btnReserve + outReserve + pinExtra)
+  const raw = Math.max(NODE_W_MIN, fromLabel + btnReserve + outReserve + pinExtra)
+  return snap(raw)
 }
 const nodeBox = (n: CircuitNode) => ({
   x: n.position.x, y: n.position.y, w: nodeWidth(n), h: nodeHeight(n),
 })
 
 function pinPos(n: CircuitNode, side: PinSide, index: number, count: number): Vec2 {
-  // Unfolded chip: return the exact inner-pin position so external wires land on it.
   if (n.kind === 'CHIP' && n.unfolded && n.unfoldedPinPos) {
     const arr = side === 'in' ? n.unfoldedPinPos.in : n.unfoldedPinPos.out
     const rel = arr[index]
@@ -433,7 +426,6 @@ function compileCircuit(
   const inputNets: Record<string, string> = {}
   const gateInputKeys = new Map<string, string[]>()
 
-  // Junction taps → source OUT pin of the wire they sit on.
   for (const j of junctions) {
     const w = circuit.wires.find((x) => x.id === j.wireId)
     if (!w) continue
@@ -704,10 +696,8 @@ function projectOnSegment(p: Vec2, a: Vec2, b: Vec2) {
   return { point, dist: Math.hypot(p.x - point.x, p.y - point.y), t }
 }
 
-/** Wire geometry uses the same half-grid used by pin centers. */
 const snapWirePoint = (p: Vec2): Vec2 => ({ x: snapHalf(p.x), y: snapHalf(p.y) })
 
-/** Snap a cursor to a point on an existing orthogonal segment without leaving that segment. */
 function snapPointToSegment(p: Vec2, a: Vec2, b: Vec2): Vec2 {
   const horizontal = Math.abs(a.y - b.y) <= 0.5
   if (horizontal) {
@@ -739,16 +729,6 @@ function collapsePolyline(points: Vec2[], epsilon = 0.75): Vec2[] {
   return out
 }
 
-/**
- * Preview only: build exactly one dynamic Manhattan bend from the last
- * committed waypoint to the snapped cursor. The committed history is never
- * changed while the pointer moves.
- *
- * Orientation priority (never rewrites committed points):
- * 1. Sticky preferH from the active DrawSession (locks first free segment).
- * 2. Continue the direction of the last committed segment when available.
- * 3. Fall back to the larger axis delta only when neither is known.
- */
 function orthogonalPathTo(points: Vec2[], next: Vec2, preferH: boolean | null = null): Vec2[] {
   if (!points.length) return [snapWirePoint(next)]
 
@@ -764,7 +744,6 @@ function orthogonalPathTo(points: Vec2[], next: Vec2, preferH: boolean | null = 
   if (preferH !== null) {
     useH = preferH
   } else if (base.length >= 2) {
-    // Continue the last committed segment's axis so the free bend does not flip it.
     const prev = base[base.length - 2]
     useH = Math.abs(prev.y - last.y) <= 0.5
   } else {
@@ -777,12 +756,10 @@ function orthogonalPathTo(points: Vec2[], next: Vec2, preferH: boolean | null = 
   return collapsePolyline([...base, corner, target])
 }
 
-/** Commit the current one-corner preview. Only a click can change this history. */
 function addOrthogonalAnchor(points: Vec2[], next: Vec2, preferH: boolean | null = null): Vec2[] {
   return orthogonalPathTo(points, next, preferH)
 }
 
-/** Repair only endpoint-induced diagonal links (for example after a node moves). */
 function ensureOrthogonalPolyline(points: Vec2[]): Vec2[] {
   if (points.length < 2) return points.map((p) => ({ ...p }))
   const out: Vec2[] = [{ ...points[0] }]
@@ -800,9 +777,6 @@ function ensureOrthogonalPolyline(points: Vec2[]): Vec2[] {
   return collapsePolyline(out)
 }
 
-/* ------------------------------------------------------------------
- * Junction anchors — a junction resolves to a point on its source wire.
- * ------------------------------------------------------------------ */
 function anchorOf(
   nodeId: string, pinId: string, side: PinSide,
   nodes: CircuitNode[], junctions: Junction[],
@@ -984,7 +958,6 @@ function strokeWirePath(ctx: CanvasRenderingContext2D, pts: Vec2[]) {
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y)
 }
 
-/** Compute the translated inner nodes of an unfolded chip within the container box. */
 function computeUnfoldedLayout(n: CircuitNode, chip: ChipDefinition) {
   const b = nodeBox(n)
   if (!chip.nodes.length) return null
@@ -1014,7 +987,6 @@ function drawUnfoldedChip(
   const b = nodeBox(n)
   const col = chip.color
 
-  // Distinct dark backdrop so the container is visually anchored.
   ctx.save()
   ctx.fillStyle = dark ? 'rgba(15,15,20,0.92)' : 'rgba(241,245,249,0.96)'
   roundRect(ctx, b.x, b.y, b.w, b.h, 4)
@@ -1037,7 +1009,6 @@ function drawUnfoldedChip(
   ctx.stroke()
   ctx.restore()
 
-  // Header
   ctx.save()
   ctx.beginPath()
   roundRect(ctx, b.x, b.y, b.w, 26, 4)
@@ -1102,11 +1073,6 @@ interface BridgeCrossing {
   underWireId: string
 }
 
-/**
- * Find all H/V crossings once when the circuit geometry changes. The renderer
- * only consumes these cached crossing coordinates while signal/hover state is
- * animated every frame.
- */
 function computeBridgeCrossings(
   wirePolys: { w: Wire; pts: Vec2[] }[],
   junctions: Junction[],
@@ -1177,7 +1143,6 @@ function drawScene(
 
   const wireActive = (w: Wire) => !!signal[pinKey(w.from.nodeId, w.from.pinId)]
 
-  // Pre-compute polylines with obstacle avoidance, then run the lane solver.
   const wirePolys: { w: Wire; pts: Vec2[]; high: boolean; hover: boolean; isSel: boolean }[] = []
   for (const w of wires) {
     const vw = wireView(w, nodes, junctions)
@@ -1259,16 +1224,11 @@ function drawScene(
     ctx.setLineDash([])
   }
 
-  // Draw each stored segment once. At a cached crossing the vertical wire has
-  // a real gap; the jumper below replaces that gap instead of being painted
-  // over an already-complete line.
   for (const seg of segments) {
     if (seg.high) drawSegmentPieces(seg, true)
     drawSegmentPieces(seg, false)
   }
 
-  // Draw the cached bridge after the line gaps have been created. Geometry is
-  // never recomputed here; only the current wire visual state is read.
   for (const bridge of bridgeCrossings) {
     const seg = segments.find((s) => s.wireId === bridge.overWireId
       && Math.abs(s.a.x - s.b.x) <= 0.5
@@ -1289,7 +1249,6 @@ function drawScene(
     ctx.setLineDash([])
   }
 
-  // Junction dots
   for (const j of junctions) {
     const active = !!signal[pinKey(j.id, 'out')]
     ctx.beginPath()
@@ -1301,7 +1260,6 @@ function drawScene(
     ctx.stroke()
   }
 
-  // Nodes
   for (const n of nodes) {
     if (n.kind === 'CHIP' && n.unfolded && n.chipId && chipById[n.chipId]) {
       drawUnfoldedChip(ctx, n, chipById[n.chipId], selected.has(n.id), signal, chipMeta, zoom, theme, dark)
@@ -1309,13 +1267,11 @@ function drawScene(
     }
     drawNode(ctx, n, selected.has(n.id), signal, chipMeta, zoom, theme, dark)
   }
-  // Pins on top (skip inner pins of unfolded chips — they're already drawn inside)
   for (const n of nodes) {
     for (const pin of enumeratePins(n))
       drawPin(ctx, pin.pos.x, pin.pos.y, !!signal[pinKey(pin.nodeId, pin.pinId)], zoom, theme)
   }
 
-  // Interactive drawing preview
   if (drawingPreview && drawingPreview.pts.length >= 2) {
     ctx.strokeStyle = theme.wireHigh
     ctx.setLineDash([6 / zoom, 4 / zoom])
@@ -1448,9 +1404,6 @@ export default function LogicMaker() {
     live.current = { nodes, wires, junctions, chips, selected, selectedWireId, selectedWireIds, placement, camera }
   })
 
-  // Crossing geometry is static between circuit edits. Rebuild it only when
-  // wires, nodes, or junctions change instead of doing intersection work in
-  // the animation frame.
   useEffect(() => {
     const wirePolys: { w: Wire; pts: Vec2[] }[] = []
     for (const w of wires) {
@@ -1477,7 +1430,6 @@ export default function LogicMaker() {
     return () => clearTimeout(t)
   }, [nodes, wires, junctions, chips, camera, dark])
 
-  // Keep junction dots glued to their source wire as nodes / wires move.
   useEffect(() => {
     let changed = false
     const next = junctions.map((j) => {
@@ -1569,7 +1521,6 @@ export default function LogicMaker() {
 
   const findPinAt = (p: Vec2, extraGrab = 0) => {
     let best: EnumeratedPin | null = null, bestD = Infinity
-    // Screen-stable hit radius; extraGrab (world units) is used while drafting for magnetic snap.
     const grab = (PIN_R + 7) / live.current.camera.zoom + extraGrab
     for (const n of live.current.nodes)
       for (const pin of enumeratePins(n)) {
@@ -1579,10 +1530,8 @@ export default function LogicMaker() {
     return best
   }
 
-  /** True if a pin is a valid wire endpoint for the current drawing session. */
   const isValidWireTarget = (pin: EnumeratedPin, from: PinRef) => {
     if (pin.nodeId === from.nodeId) return false
-    // After normalisation we need an out→in pair; either orientation is fine here.
     if (from.side === 'out' && pin.side === 'in') return true
     if (from.side === 'in' && pin.side === 'out') return true
     return false
@@ -1614,7 +1563,6 @@ export default function LogicMaker() {
     return p.x >= bx && p.x <= bx + btnW && p.y >= by && p.y <= by + btnH
   }
 
-  /** Snap a point onto the current path of the given wire. */
   const projectOnWire = (wireId: string, p: Vec2): Vec2 | null => {
     const w = live.current.wires.find((x) => x.id === wireId)
     if (!w) return null
@@ -1688,8 +1636,6 @@ export default function LogicMaker() {
     setPaletteCtxMenu(null)
   }
 
-  /* ---------------- interactive orthogonal wire drawing ---------------- */
-
   const startDrawing = (pin: EnumeratedPin) => {
     const start = snapWirePoint(pin.pos)
     drawing.current = {
@@ -1712,9 +1658,7 @@ export default function LogicMaker() {
     if (!d) return
     let a = d.from
     let b: PinRef = { nodeId, pinId, side }
-    // Allow either direction; normalise so wires always store out → in.
     if (a.side === 'in' && b.side === 'out') { const t = a; a = b; b = t }
-    // Junction pseudo-pins use side 'in' when targeted; treat junction ids as valid sinks.
     const toIsJunction = !!live.current.junctions.find((j) => j.id === b.nodeId)
     const fromIsJunction = !!live.current.junctions.find((j) => j.id === a.nodeId)
     if (!toIsJunction && !fromIsJunction) {
@@ -1740,7 +1684,6 @@ export default function LogicMaker() {
     cancelDrawing()
   }
 
-  /** Create a permanent junction on an existing wire and return it. */
   const createJunctionOnWire = (wireId: string, p: Vec2): Junction | null => {
     const pt = projectOnWire(wireId, p)
     if (!pt) return null
@@ -1748,8 +1691,6 @@ export default function LogicMaker() {
     setJunctions((js) => [...js, j])
     return j
   }
-
-  /* ---------------- pointer handlers ---------------- */
 
   const onPointerDown = (e: React.PointerEvent) => {
     setCtxMenu(null)
@@ -1775,10 +1716,8 @@ export default function LogicMaker() {
 
     if (placement) { place(p); return }
 
-    /* ---- Active P2P drawing session ---- */
     if (drawing.current) {
       const d = drawing.current
-      // Larger grab while drafting so clicks near pins reliably complete the wire.
       const pinHit = findPinAt(p, 10)
       if (pinHit && isValidWireTarget(pinHit, d.from)) {
         finishDrawing(pinHit.nodeId, pinHit.pinId, pinHit.side, pinHit.pos)
@@ -1790,8 +1729,6 @@ export default function LogicMaker() {
         const j = pt ? createJunctionOnWire(wireHitId, pt) : null
         if (j) { finishDrawing(j.id, 'j', 'in', j.point); return }
       }
-      // Empty clicks permanently lock the current waypoints/corners. Subsequent
-      // movement only affects the new leading segment (preferH resets).
       const committed = snapWirePoint(p)
       d.points = addOrthogonalAnchor(d.points, committed, d.preferH)
       d.cursor = committed
@@ -1891,8 +1828,6 @@ export default function LogicMaker() {
 
     if (drawing.current) {
       const d = drawing.current
-      // Magnetic snap: when near a valid target pin, lock the free end onto it
-      // so a subsequent click reliably finishes the connection.
       const magnetPin = findPinAt(p, 12)
       let target: Vec2
       if (magnetPin && isValidWireTarget(magnetPin, d.from)) {
@@ -1903,9 +1838,6 @@ export default function LogicMaker() {
       const previousCursor = d.cursor
       mousePos.current = target
 
-      // Establish sticky orientation once the free segment has moved far enough
-      // from the last locked waypoint. This prevents the path from flipping
-      // when the cursor crosses the 45° diagonal.
       if (d.preferH === null && d.points.length >= 1) {
         const last = d.points[d.points.length - 1]
         const adx = Math.abs(target.x - last.x)
@@ -1916,16 +1848,12 @@ export default function LogicMaker() {
         }
       }
 
-      // Passing back over a committed waypoint rolls the path back. A waypoint
-      // is removed only while the pointer is actually moving toward it; this
-      // prevents the first pointer event after a click from undoing the click.
       const cursorMoved = previousCursor.x !== target.x || previousCursor.y !== target.y
       if (cursorMoved && d.points.length > 1) {
         for (let i = d.points.length - 1; i >= 1; i--) {
           const wp = d.points[i]
           if (wp.x === target.x && wp.y === target.y) {
             d.points = d.points.slice(0, i)
-            // After roll-back, re-derive preference from the new last segment.
             d.preferH = null
             break
           }
@@ -1938,8 +1866,6 @@ export default function LogicMaker() {
     if (drag.current?.kind === 'box') { drag.current.endX = p.x; drag.current.endY = p.y }
     else if (drag.current?.kind === 'move') {
       const d = drag.current
-      // Keep node origins on the main grid so their pin centers remain aligned
-      // with the wire half-grid used by routing.
       const dx = snap(p.x - d.startWorld.x), dy = snap(p.y - d.startWorld.y)
       const idSet = new Set(d.ids)
       const nextNodes = live.current.nodes.map((n) => idSet.has(n.id)
@@ -1963,8 +1889,6 @@ export default function LogicMaker() {
       if (canvasRef.current) canvasRef.current.style.cursor = spaceDown.current ? 'grab' : 'default'
       return
     }
-    // While drafting, also complete the wire on pointer-up if the cursor is
-    // magnetically over a valid target pin (covers near-misses on pointer-down).
     if (drawing.current) {
       const r = canvasRect()
       const p = screenToWorld(e.clientX - r.left, e.clientY - r.top)
@@ -2101,7 +2025,6 @@ export default function LogicMaker() {
     setCreateModal(false)
   }
 
-  /** Unfold a chip inline, computing the exact inner-pin landing points. */
   const unfoldChip = (nodeId: string) => {
     const node = live.current.nodes.find((n) => n.id === nodeId)
     if (!node || node.kind !== 'CHIP' || !node.chipId) return
@@ -2114,10 +2037,9 @@ export default function LogicMaker() {
       maxX = Math.max(maxX, b.x + b.w); maxY = Math.max(maxY, b.y + b.h)
     }
     const pad = 40, header = 28
-    const w = Math.max(260, (maxX - minX) + pad * 2)
-    const h = Math.max(140, (maxY - minY) + pad * 2 + header)
+    const w = snap(Math.max(260, (maxX - minX) + pad * 2))
+    const h = snap(Math.max(140, (maxY - minY) + pad * 2 + header))
 
-    // Same placement formula used by computeUnfoldedLayout
     const offX = node.position.x + (w - (maxX - minX)) / 2 - minX
     const offY = node.position.y + header + (h - header - (maxY - minY)) / 2 - minY
     const byId = new Map<string, CircuitNode>(chip.nodes.map((cn) => [cn.id, {
@@ -2289,7 +2211,6 @@ export default function LogicMaker() {
       const spec = PRIMITIVE_SPEC[target.kind]
       newInputs = makePins(spec.inputs)
       newOutputs = makePins(spec.outputs)
-      // STRICT: always reset to the default name of the new block
       newLabel = spec.label
       newKind = target.kind
       value = (target.kind === 'INPUT' || target.kind === 'BUTTON') ? (old.value ?? false) : undefined
@@ -2362,7 +2283,9 @@ export default function LogicMaker() {
   }
 
   const onDoubleClick = (e: React.MouseEvent) => {
-    if (placement || drawing.current) return
+    // Double-click while drawing cancels the session.
+    if (drawing.current) { cancelDrawing(); return }
+    if (placement) return
     const p = screenToWorld(e.clientX - canvasRect().left, e.clientY - canvasRect().top)
     const pin = findPinAt(p)
     if (pin) {
@@ -2626,7 +2549,6 @@ export default function LogicMaker() {
         ? { x: drag.current.startX, y: drag.current.startY, w: drag.current.endX - drag.current.startX, h: drag.current.endY - drag.current.startY }
         : null
 
-      // Live point-to-point drawing preview
       let drawingPreview: { fromPos: Vec2; pts: Vec2[] } | null = null
       if (drawing.current) {
         const d = drawing.current
@@ -3053,7 +2975,6 @@ export default function LogicMaker() {
             <p className="mb-3 text-[11px] opacity-60">Wires are re-mapped by pin index. Label resets to the new default.</p>
 
             <div className="max-h-[280px] overflow-y-auto pr-1">
-              {/* ── I/O ───────────────────────────────────────────── */}
               <div className="mb-1 px-1 text-[10px] font-semibold uppercase tracking-wider opacity-50">I/O</div>
               <div className="mb-3 flex flex-col gap-0.5">
                 {IO_BLOCKS.map((k) => (
@@ -3065,7 +2986,6 @@ export default function LogicMaker() {
                 ))}
               </div>
 
-              {/* ── Standard Gates & Latches ──────────────────────── */}
               <div className="mb-1 px-1 text-[10px] font-semibold uppercase tracking-wider opacity-50">Standard Gates</div>
               <div className="mb-3 flex flex-col gap-0.5">
                 {STANDARD_GATES.map((k) => (
@@ -3084,7 +3004,6 @@ export default function LogicMaker() {
                 ))}
               </div>
 
-              {/* ── Custom Chips ──────────────────────────────────── */}
               {customChips.length > 0 && (
                 <>
                   <div className="mb-1 px-1 text-[10px] font-semibold uppercase tracking-wider opacity-50">Custom Chips</div>
