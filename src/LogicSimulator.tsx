@@ -30,7 +30,16 @@ import {
 } from 'lucide-react'
 
 /* =====================================================================
- *  LogicMaker — refactored (grid-aligned, universal nets, clean bridges)
+ *  LogicSimulator — COMPLETE REWRITE (v5)
+ *  ---------------------------------------------------------------------
+ *  FIXES IN THIS VERSION:
+ *   1. HARD COLLISION: wires clip at component edges while drafting.
+ *   2. PURE VECTOR WIRES: no junction dots, no pin circles when connected.
+ *   3. UNION-FIND NET SOLVER with OR semantics: any true driver ⇒ net true.
+ *   4. AUTO-JUNCTION: wire endpoints landing on another wire's body
+ *      automatically merge into the same net (the "one essence" rule).
+ *   5. FORGIVING SNAP: pins snap within 24 px, wires within 16 px.
+ *   6. Save/load stores net adjacency explicitly.
  * ===================================================================== */
 
 type PinSide = 'in' | 'out'
@@ -56,17 +65,14 @@ interface CircuitNode {
   rotation?: 0 | 90 | 180 | 270
   unfolded?: boolean
   unfoldedSize?: { w: number; h: number }
-  /** Absolute-inner-pin offsets relative to node.position, populated on unfold. */
   unfoldedPinPos?: { in: Vec2[]; out: Vec2[] }
 }
 interface Wire {
   id: string
   from: PinRef
   to: PinRef
-  /** Persisted drawing path. Endpoints are refreshed from pin/junction anchors. */
   points?: Vec2[]
 }
-/** A permanent tap on an existing wire — the origin of a branch. */
 interface Junction {
   id: string
   wireId: string
@@ -108,7 +114,6 @@ interface ContextMenuState {
   wireId?: string
 }
 
-/** Active point-to-point drawing session. */
 interface DrawSession {
   from: PinRef
   fromPos: Vec2
@@ -130,6 +135,10 @@ const PIN_SPACING = 24
 const PIN_R = 5.5
 const MIN_ZOOM = 0.05
 const MAX_ZOOM = 4
+const WIRE_CLEARANCE = 4
+const PIN_SNAP_RADIUS = 24
+const WIRE_SNAP_RADIUS = 16
+const WIRE_MERGE_TOL = 6
 
 let idCounter = 0
 const uid = (prefix = 'n') =>
@@ -398,218 +407,398 @@ function makeBuiltInChips(): ChipDefinition[] {
   return [rs, buildDLatch(rs)]
 }
 
-/* Compiler */
-type GateType = 'AND' | 'OR' | 'NOT' | 'NAND' | 'NOR' | 'XOR' | 'XNOR'
-interface CompiledGate {
+/* =====================================================================
+ *  UNION-FIND NET SOLVER
+ * ===================================================================== */
+
+class UnionFind {
+  private parent = new Map<string, string>()
+  find(x: string): string {
+    const p = this.parent.get(x)
+    if (p === undefined) { this.parent.set(x, x); return x }
+    if (p === x) return x
+    const root = this.find(p)
+    this.parent.set(x, root)
+    return root
+  }
+  union(a: string, b: string) {
+    const ra = this.find(a), rb = this.find(b)
+    if (ra !== rb) this.parent.set(ra, rb)
+  }
+}
+
+interface FlattenedGate {
   key: string
-  type: GateType
-  inputs: (string | null)[]
-  out: string
-}
-interface CompiledCircuit {
-  gates: CompiledGate[]
-  inputNets: Record<string, string>
-  pinNets: Record<string, string | null>
+  type: 'AND' | 'OR' | 'NOT' | 'NAND' | 'NOR' | 'XOR' | 'XNOR'
+  inputKeys: string[]
+  outputKey: string
 }
 
-const MAX_DEPTH = 24
+interface NetModel {
+  terminalNet: Map<string, string>
+  allTerminals: Set<string>
+  gates: FlattenedGate[]
+  sourceKeys: Set<string>
+}
 
-function compileCircuit(
-  circuit: { nodes: CircuitNode[]; wires: Wire[] },
+/* Wire geometry helpers (declared early so buildNetModel can use them) */
+const snapWirePoint = (p: Vec2): Vec2 => ({ x: snapHalf(p.x), y: snapHalf(p.y) })
+
+function collapsePolyline(points: Vec2[], epsilon = 0.75): Vec2[] {
+  if (points.length <= 2) return points.map((p) => ({ ...p }))
+  const out: Vec2[] = []
+  for (const p of points) {
+    const last = out[out.length - 1]
+    if (last && Math.hypot(p.x - last.x, p.y - last.y) <= epsilon) continue
+    out.push({ ...p })
+    while (out.length >= 3) {
+      const a = out[out.length - 3]
+      const b = out[out.length - 2]
+      const c = out[out.length - 1]
+      const cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
+      const ab = Math.hypot(b.x - a.x, b.y - a.y)
+      const bc = Math.hypot(c.x - b.x, c.y - b.y)
+      if (Math.abs(cross) <= epsilon * Math.max(1, ab + bc)) out.splice(out.length - 2, 1)
+      else break
+    }
+  }
+  return out
+}
+
+function ensureOrthogonalPolyline(points: Vec2[]): Vec2[] {
+  if (points.length < 2) return points.map((p) => ({ ...p }))
+  const out: Vec2[] = [{ ...points[0] }]
+  for (let i = 1; i < points.length; i++) {
+    const target = { ...points[i] }
+    const last = out[out.length - 1]
+    if (last.x !== target.x && last.y !== target.y) {
+      const corner = Math.abs(target.x - last.x) >= Math.abs(target.y - last.y)
+        ? { x: target.x, y: last.y }
+        : { x: last.x, y: target.y }
+      out.push(corner)
+    }
+    out.push(target)
+  }
+  return collapsePolyline(out)
+}
+
+function anchorOf(
+  nodeId: string, pinId: string, side: PinSide,
+  nodes: CircuitNode[], junctions: Junction[],
+): Vec2 | null {
+  const j = junctions.find((x) => x.id === nodeId)
+  if (j) return j.point
+  const n = nodes.find((x) => x.id === nodeId)
+  if (!n) return null
+  return pinAnchor(n, { side, pinId })
+}
+
+function pinAnchor(n: CircuitNode, w: { side: PinSide; pinId: string }): Vec2 | null {
+  if (w.side === 'out') {
+    const i = n.outputs.findIndex((p) => p.id === w.pinId)
+    return i >= 0 ? rightPinPos(n, i) : null
+  }
+  const i = n.inputs.findIndex((p) => p.id === w.pinId)
+  return i >= 0 ? leftPinPos(n, i) : null
+}
+
+function wireView(w: Wire, nodes: CircuitNode[], junctions: Junction[]): { pts: Vec2[] } | null {
+  const a = anchorOf(w.from.nodeId, w.from.pinId, w.from.side, nodes, junctions)
+  const b = anchorOf(w.to.nodeId, w.to.pinId, w.to.side, nodes, junctions)
+  if (!a || !b) return null
+  const stored = w.points?.length ? w.points : [a, b]
+  const pts = stored.map(snapWirePoint)
+  pts[0] = { ...a }
+  pts[pts.length - 1] = { ...b }
+  return { pts: ensureOrthogonalPolyline(pts) }
+}
+
+function flattenGates(
+  nodes: CircuitNode[], prefix: string,
+  chips: Record<string, ChipDefinition>, depth: number,
+  acc: FlattenedGate[],
+) {
+  if (depth > 16) return
+  for (const n of nodes) {
+    const id = prefix + n.id
+    if (n.kind === 'CHIP' && n.chipId) {
+      const chip = chips[n.chipId]
+      if (!chip) continue
+      flattenGates(chip.nodes, `${id}/`, chips, depth + 1, acc)
+    } else if (['AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR', 'XNOR'].includes(n.kind)) {
+      acc.push({
+        key: id,
+        type: n.kind as any,
+        inputKeys: n.inputs.map((p) => pinKey(id, p.id)),
+        outputKey: pinKey(id, n.outputs[0].id),
+      })
+    }
+  }
+}
+
+function buildNetModel(
+  nodes: CircuitNode[],
+  wires: Wire[],
+  junctions: Junction[],
   chips: Record<string, ChipDefinition>,
-  junctions: Junction[] = [],
-): CompiledCircuit {
-  const gates: CompiledGate[] = []
-  const drivers = new Map<string, string>()
-  const aliases = new Map<string, string>()
-  const junctionSources = new Map<string, string>()
-  const inputNets: Record<string, string> = {}
-  const gateInputKeys = new Map<string, string[]>()
+): NetModel {
+  const uf = new UnionFind()
+  const allTerminals = new Set<string>()
 
-  for (const j of junctions) {
-    const w = circuit.wires.find((x) => x.id === j.wireId)
-    if (!w) continue
-    const srcKey = pinKey(w.from.nodeId, w.from.pinId)
-    junctionSources.set(pinKey(j.id, 'out'), srcKey)
-    junctionSources.set(pinKey(j.id, 'in'), srcKey)
+  const touch = (key: string) => { uf.find(key); allTerminals.add(key) }
+
+  // 1. Register all top-level pins.
+  for (const n of nodes) {
+    for (const p of n.inputs) touch(pinKey(n.id, p.id))
+    for (const p of n.outputs) touch(pinKey(n.id, p.id))
   }
 
-  const walk = (c: { nodes: CircuitNode[]; wires: Wire[] }, prefix: string, depth: number) => {
-    for (const w of c.wires) {
-      drivers.set(
-        pinKey(prefix + w.to.nodeId, w.to.pinId),
-        pinKey(prefix + w.from.nodeId, w.from.pinId),
-      )
+  // 2. Wires union their endpoints.
+  for (const w of wires) {
+    const fromKey = pinKey(w.from.nodeId, w.from.pinId)
+    const toKey = pinKey(w.to.nodeId, w.to.pinId)
+    touch(fromKey); touch(toKey)
+    uf.union(fromKey, toKey)
+  }
+
+  // 3. Junctions union to the wire they tap.
+  for (const j of junctions) {
+    touch(j.id)
+    const w = wires.find((x) => x.id === j.wireId)
+    if (w) {
+      const anchorKey = pinKey(w.from.nodeId, w.from.pinId)
+      touch(anchorKey)
+      uf.union(j.id, anchorKey)
     }
-    for (const node of c.nodes) {
-      const id = prefix + node.id
-      switch (node.kind) {
-        case 'AND': case 'OR': case 'NOT':
-        case 'NAND': case 'NOR': case 'XOR': case 'XNOR': {
-          gates.push({ key: id, type: node.kind, inputs: [], out: pinKey(id, node.outputs[0].id) })
-          gateInputKeys.set(id, node.inputs.map((p) => pinKey(id, p.id)))
-          break
-        }
-        case 'INPUT': case 'CLOCK': case 'BUTTON':
-          if (prefix === '') inputNets[node.id] = pinKey(id, 'out')
-          break
-        case 'OUTPUT': break
-        case 'CHIP': {
-          const chip = node.chipId ? chips[node.chipId] : undefined
-          if (!chip || depth >= MAX_DEPTH) break
-          const inner = `${id}/`
-          chip.inputNodeIds.forEach((innerId, i) => {
-            aliases.set(pinKey(inner + innerId, 'out'), pinKey(id, `i${i}`))
-          })
-          chip.outputNodeIds.forEach((innerId, i) => {
-            aliases.set(pinKey(id, `o${i}`), pinKey(inner + innerId, 'in'))
-          })
-          walk({ nodes: chip.nodes, wires: chip.wires }, inner, depth + 1)
-          break
+  }
+
+  // 4. AUTO-JUNCTION: wire endpoints that land on another wire's body merge.
+  //    This is the "one essence" rule — a wire ending on another wire becomes
+  //    electrically part of that wire's net.
+  const wireGeom: { w: Wire; pts: Vec2[] }[] = []
+  for (const w of wires) {
+    const vw = wireView(w, nodes, junctions)
+    if (vw) wireGeom.push({ w, pts: vw.pts })
+  }
+  for (const w of wires) {
+    const fromPos = anchorOf(w.from.nodeId, w.from.pinId, w.from.side, nodes, junctions)
+    const toPos = anchorOf(w.to.nodeId, w.to.pinId, w.to.side, nodes, junctions)
+    const wFromKey = pinKey(w.from.nodeId, w.from.pinId)
+    const wToKey = pinKey(w.to.nodeId, w.to.pinId)
+    for (const other of wireGeom) {
+      if (other.w.id === w.id) continue
+      const otherKey = pinKey(other.w.from.nodeId, other.w.from.pinId)
+      // Skip if this endpoint IS the other wire's endpoint (already unioned).
+      if (otherKey === wFromKey || otherKey === wToKey) continue
+      if (fromPos) {
+        for (let i = 0; i < other.pts.length - 1; i++) {
+          if (distToSegment(fromPos, other.pts[i], other.pts[i + 1]) <= WIRE_MERGE_TOL) {
+            touch(otherKey)
+            uf.union(wFromKey, otherKey)
+            break
+          }
         }
       }
-    }
-  }
-  walk(circuit, '', 0)
-
-  const memo = new Map<string, string | null>()
-  const resolveOut = (outKey: string, seen: Set<string>): string | null => {
-    if (memo.has(outKey)) return memo.get(outKey)!
-    const jSrc = junctionSources.get(outKey)
-    if (jSrc) {
-      const v = resolveOut(jSrc, seen)
-      memo.set(outKey, v)
-      return v
-    }
-    const alias = aliases.get(outKey)
-    if (alias) {
-      const v = netOfInput(alias, seen)
-      memo.set(outKey, v)
-      return v
-    }
-    memo.set(outKey, outKey)
-    return outKey
-  }
-  const netOfInput = (inKey: string, seen: Set<string>): string | null => {
-    if (seen.has(inKey)) return null
-    seen.add(inKey)
-    const jSrc = junctionSources.get(inKey)
-    if (jSrc) {
-      const v = resolveOut(jSrc, seen)
-      seen.delete(inKey)
-      return v
-    }
-    const drive = drivers.get(inKey)
-    if (drive === undefined) {
-      const alias = aliases.get(inKey)
-      if (alias) {
-        const v = netOfInput(alias, seen)
-        seen.delete(inKey)
-        return v
-      }
-      seen.delete(inKey)
-      return null
-    }
-    const result = resolveOut(drive, seen)
-    seen.delete(inKey)
-    return result
-  }
-  const resolveIn = (inKey: string): string | null => {
-    if (memo.has(inKey)) return memo.get(inKey)!
-    const v = netOfInput(inKey, new Set())
-    memo.set(inKey, v)
-    return v
-  }
-
-  for (const g of gates) {
-    const keys = gateInputKeys.get(g.key) ?? []
-    g.inputs = keys.map((k) => resolveIn(k))
-  }
-
-  const pinNets: Record<string, string | null> = {}
-  for (const node of circuit.nodes) {
-    for (const p of node.inputs) pinNets[pinKey(node.id, p.id)] = resolveIn(pinKey(node.id, p.id))
-    for (const p of node.outputs) pinNets[pinKey(node.id, p.id)] = resolveOut(pinKey(node.id, p.id), new Set())
-  }
-  for (const j of junctions) {
-    const net = resolveOut(pinKey(j.id, 'out'), new Set())
-    pinNets[pinKey(j.id, 'out')] = net
-    pinNets[pinKey(j.id, 'in')] = net
-  }
-  return { gates, inputNets, pinNets }
-}
-
-/* Simulator */
-const SETTLE_PASSES = 80
-const SIM_TPS = 60
-
-class Simulator {
-  private state = new Map<string, boolean>()
-  private compiled: CompiledCircuit = { gates: [], inputNets: {}, pinNets: {} }
-  private tickCount = 0
-
-  load(c: CompiledCircuit) {
-    const next = new Map<string, boolean>()
-    for (const g of c.gates) next.set(g.out, this.state.get(g.out) ?? false)
-    for (const net of Object.values(c.inputNets)) next.set(net, this.state.get(net) ?? false)
-    this.state = next
-    this.compiled = c
-  }
-  reset() { for (const k of this.state.keys()) this.state.set(k, false); this.tickCount = 0 }
-
-  private applyInputs(nodes: CircuitNode[]) {
-    for (const n of nodes) {
-      if (n.kind === 'INPUT' || n.kind === 'BUTTON') {
-        const net = this.compiled.inputNets[n.id]
-        if (net) this.state.set(net, !!n.value)
-      } else if (n.kind === 'CLOCK') {
-        const net = this.compiled.inputNets[n.id]
-        if (net) {
-          if (n.enabled === false) {
-            this.state.set(net, false)
-          } else {
-            const period = Math.max(2, n.period ?? 30)
-            const half = Math.floor(period / 2)
-            this.state.set(net, (this.tickCount % period) < half)
+      if (toPos) {
+        for (let i = 0; i < other.pts.length - 1; i++) {
+          if (distToSegment(toPos, other.pts[i], other.pts[i + 1]) <= WIRE_MERGE_TOL) {
+            touch(otherKey)
+            uf.union(wToKey, otherKey)
+            break
           }
         }
       }
     }
   }
-  private read(net: string | null) { return net === null ? false : (this.state.get(net) ?? false) }
+
+  // 5. Co-located pins union.
+  const anchors: { key: string; pos: Vec2 }[] = []
+  for (const n of nodes) {
+    for (const pin of enumeratePins(n)) {
+      anchors.push({ key: pinKey(pin.nodeId, pin.pinId), pos: pin.pos })
+    }
+  }
+  for (let i = 0; i < anchors.length; i++) {
+    for (let k = i + 1; k < anchors.length; k++) {
+      const a = anchors[i], b = anchors[k]
+      if (Math.abs(a.pos.x - b.pos.x) <= 1 && Math.abs(a.pos.y - b.pos.y) <= 1) {
+        uf.union(a.key, b.key)
+      }
+    }
+  }
+
+  // 6. Chip boundary pins → inner source/sink pins.
+  function linkChip(node: CircuitNode, depth: number) {
+    if (depth > 16) return
+    if (node.kind !== 'CHIP' || !node.chipId) return
+    const chip = chips[node.chipId]
+    if (!chip) return
+    chip.inputNodeIds.forEach((innerId, i) => {
+      const innerNode = chip.nodes.find((x) => x.id === innerId)
+      if (!innerNode || !innerNode.outputs[0]) return
+      const outerKey = pinKey(node.id, `i${i}`)
+      const innerKey = pinKey(`${node.id}/${innerId}`, innerNode.outputs[0].id)
+      touch(outerKey); touch(innerKey)
+      uf.union(outerKey, innerKey)
+    })
+    chip.outputNodeIds.forEach((innerId, i) => {
+      const innerNode = chip.nodes.find((x) => x.id === innerId)
+      if (!innerNode || !innerNode.inputs[0]) return
+      const outerKey = pinKey(node.id, `o${i}`)
+      const innerKey = pinKey(`${node.id}/${innerId}`, innerNode.inputs[0].id)
+      touch(outerKey); touch(innerKey)
+      uf.union(outerKey, innerKey)
+    })
+    for (const iw of chip.wires) {
+      const fromKey = pinKey(`${node.id}/${iw.from.nodeId}`, iw.from.pinId)
+      const toKey = pinKey(`${node.id}/${iw.to.nodeId}`, iw.to.pinId)
+      touch(fromKey); touch(toKey)
+      uf.union(fromKey, toKey)
+    }
+    for (const innerNode of chip.nodes) {
+      for (const p of innerNode.inputs) touch(pinKey(`${node.id}/${innerNode.id}`, p.id))
+      for (const p of innerNode.outputs) touch(pinKey(`${node.id}/${innerNode.id}`, p.id))
+      if (innerNode.kind === 'CHIP') linkChip(
+        { ...innerNode, id: `${node.id}/${innerNode.id}` }, depth + 1,
+      )
+    }
+  }
+  for (const n of nodes) if (n.kind === 'CHIP') linkChip(n, 0)
+
+  // 7. Resolve terminal → net root.
+  const terminalNet = new Map<string, string>()
+  for (const key of allTerminals) terminalNet.set(key, uf.find(key))
+
+  // 8. Flatten gates.
+  const gates: FlattenedGate[] = []
+  flattenGates(nodes, '', chips, 0, gates)
+
+  // 9. Collect source keys.
+  const sourceKeys = new Set<string>()
+  function collectSources(ns: CircuitNode[], prefix: string, depth: number) {
+    if (depth > 16) return
+    for (const n of ns) {
+      const id = prefix + n.id
+      if (n.kind === 'INPUT' || n.kind === 'BUTTON' || n.kind === 'CLOCK') {
+        const key = pinKey(id, n.outputs[0].id)
+        sourceKeys.add(key)
+        touch(key)
+        terminalNet.set(key, uf.find(key))
+      } else if (n.kind === 'CHIP' && n.chipId) {
+        const chip = chips[n.chipId]
+        if (chip) collectSources(chip.nodes, `${id}/`, depth + 1)
+      }
+    }
+  }
+  collectSources(nodes, '', 0)
+
+  return { terminalNet, allTerminals, gates, sourceKeys }
+}
+
+/* =====================================================================
+ *  SIMULATOR — OR semantics on nets
+ * ===================================================================== */
+
+const SETTLE_PASSES = 200
+const SIM_TPS = 60
+
+class Simulator {
+  private netValues = new Map<string, boolean>()
+  private model: NetModel | null = null
+  private tickCount = 0
+
+  load(model: NetModel) {
+    this.model = model
+    const next = new Map<string, boolean>()
+    for (const root of new Set(model.terminalNet.values())) {
+      next.set(root, this.netValues.get(root) ?? false)
+    }
+    this.netValues = next
+  }
+
+  reset() {
+    this.netValues.clear()
+    this.tickCount = 0
+  }
+
+  private readNet(root: string | undefined): boolean {
+    if (!root) return false
+    return this.netValues.get(root) ?? false
+  }
+
+  private evalGate(type: FlattenedGate['type'], a: boolean, b: boolean): boolean {
+    switch (type) {
+      case 'AND': return a && b
+      case 'OR': return a || b
+      case 'NOT': return !a
+      case 'NAND': return !(a && b)
+      case 'NOR': return !(a || b)
+      case 'XOR': return a !== b
+      case 'XNOR': return a === b
+    }
+  }
 
   tick(nodes: CircuitNode[]) {
+    const model = this.model
+    if (!model) return
     this.tickCount++
-    this.applyInputs(nodes)
-    const { gates } = this.compiled
-    for (let pass = 0; pass < SETTLE_PASSES; pass++) {
-      let changed = false
-      const results = new Array<boolean>(gates.length)
-      for (let i = 0; i < gates.length; i++) {
-        const g = gates[i]
-        const a = this.read(g.inputs[0])
-        const b = this.read(g.inputs[1])
-        switch (g.type) {
-          case 'AND': results[i] = a && b; break
-          case 'OR': results[i] = a || b; break
-          case 'NOT': results[i] = !a; break
-          case 'NAND': results[i] = !(a && b); break
-          case 'NOR': results[i] = !(a || b); break
-          case 'XOR': results[i] = a !== b; break
-          case 'XNOR': results[i] = a === b; break
+
+    // Clear all nets.
+    for (const root of new Set(model.terminalNet.values())) {
+      this.netValues.set(root, false)
+    }
+
+    // Apply direct sources: INPUT, BUTTON, CLOCK.
+    for (const n of nodes) {
+      if (n.kind === 'INPUT' || n.kind === 'BUTTON') {
+        const key = pinKey(n.id, n.outputs[0]?.id ?? 'out')
+        const root = model.terminalNet.get(key)
+        if (root && n.value) this.netValues.set(root, true)
+      } else if (n.kind === 'CLOCK') {
+        const key = pinKey(n.id, n.outputs[0]?.id ?? 'out')
+        const root = model.terminalNet.get(key)
+        if (root) {
+          if (n.enabled === false) {
+            this.netValues.set(root, false)
+          } else {
+            const period = Math.max(2, n.period ?? 30)
+            const half = Math.floor(period / 2)
+            const high = (this.tickCount % period) < half
+            if (high) this.netValues.set(root, true)
+          }
         }
       }
-      for (let i = 0; i < gates.length; i++) {
-        if (this.state.get(gates[i].out) !== results[i]) {
-          this.state.set(gates[i].out, results[i]); changed = true
+    }
+
+    // Iteratively evaluate gates, OR-ing their outputs onto nets.
+    for (let pass = 0; pass < SETTLE_PASSES; pass++) {
+      let changed = false
+      const snapshot = new Map(this.netValues)
+      for (const g of model.gates) {
+        const inRoots = g.inputKeys.map((k) => model.terminalNet.get(k))
+        const a = this.readNet(inRoots[0])
+        const b = inRoots.length > 1 ? this.readNet(inRoots[1]) : false
+        const value = this.evalGate(g.type, a, b)
+        if (!value) continue
+        const outRoot = model.terminalNet.get(g.outputKey)
+        if (!outRoot) continue
+        if (!snapshot.get(outRoot)) {
+          this.netValues.set(outRoot, true)
+          changed = true
         }
       }
       if (!changed) break
     }
   }
+
   snapshot(): SignalMap {
     const out: SignalMap = {}
-    for (const [k, net] of Object.entries(this.compiled.pinNets)) out[k] = this.read(net)
+    const model = this.model
+    if (!model) return out
+    for (const key of model.allTerminals) {
+      const root = model.terminalNet.get(key)
+      out[key] = root ? (this.netValues.get(root) ?? false) : false
+    }
     return out
   }
 }
@@ -679,10 +868,6 @@ function drawGrid(ctx: CanvasRenderingContext2D, left: number, top: number, righ
     }
 }
 
-/* =========================================================
- *  Wire geometry — direct mouse-traced polylines
- * ========================================================= */
-
 function projectOnSegment(p: Vec2, a: Vec2, b: Vec2) {
   const dx = b.x - a.x, dy = b.y - a.y
   const l2 = dx * dx + dy * dy
@@ -696,8 +881,6 @@ function projectOnSegment(p: Vec2, a: Vec2, b: Vec2) {
   return { point, dist: Math.hypot(p.x - point.x, p.y - point.y), t }
 }
 
-const snapWirePoint = (p: Vec2): Vec2 => ({ x: snapHalf(p.x), y: snapHalf(p.y) })
-
 function snapPointToSegment(p: Vec2, a: Vec2, b: Vec2): Vec2 {
   const horizontal = Math.abs(a.y - b.y) <= 0.5
   if (horizontal) {
@@ -706,27 +889,6 @@ function snapPointToSegment(p: Vec2, a: Vec2, b: Vec2): Vec2 {
   }
   const y = clamp(snapHalf(p.y), Math.min(a.y, b.y), Math.max(a.y, b.y))
   return { x: a.x, y }
-}
-
-function collapsePolyline(points: Vec2[], epsilon = 0.75): Vec2[] {
-  if (points.length <= 2) return points.map((p) => ({ ...p }))
-  const out: Vec2[] = []
-  for (const p of points) {
-    const last = out[out.length - 1]
-    if (last && Math.hypot(p.x - last.x, p.y - last.y) <= epsilon) continue
-    out.push({ ...p })
-    while (out.length >= 3) {
-      const a = out[out.length - 3]
-      const b = out[out.length - 2]
-      const c = out[out.length - 1]
-      const cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
-      const ab = Math.hypot(b.x - a.x, b.y - a.y)
-      const bc = Math.hypot(c.x - b.x, c.y - b.y)
-      if (Math.abs(cross) <= epsilon * Math.max(1, ab + bc)) out.splice(out.length - 2, 1)
-      else break
-    }
-  }
-  return out
 }
 
 function orthogonalPathTo(points: Vec2[], next: Vec2, preferH: boolean | null = null): Vec2[] {
@@ -760,52 +922,33 @@ function addOrthogonalAnchor(points: Vec2[], next: Vec2, preferH: boolean | null
   return orthogonalPathTo(points, next, preferH)
 }
 
-function ensureOrthogonalPolyline(points: Vec2[]): Vec2[] {
-  if (points.length < 2) return points.map((p) => ({ ...p }))
-  const out: Vec2[] = [{ ...points[0] }]
-  for (let i = 1; i < points.length; i++) {
-    const target = { ...points[i] }
-    const last = out[out.length - 1]
-    if (last.x !== target.x && last.y !== target.y) {
-      const corner = Math.abs(target.x - last.x) >= Math.abs(target.y - last.y)
-        ? { x: target.x, y: last.y }
-        : { x: last.x, y: target.y }
-      out.push(corner)
-    }
-    out.push(target)
+function pointInAnyNode(p: Vec2, nodes: CircuitNode[], ignoreIds?: Set<string>): boolean {
+  for (const n of nodes) {
+    if (ignoreIds?.has(n.id)) continue
+    const b = nodeBox(n)
+    if (
+      p.x >= b.x - WIRE_CLEARANCE &&
+      p.x <= b.x + b.w + WIRE_CLEARANCE &&
+      p.y >= b.y - WIRE_CLEARANCE &&
+      p.y <= b.y + b.h + WIRE_CLEARANCE
+    ) return true
   }
-  return collapsePolyline(out)
+  return false
 }
 
-function anchorOf(
-  nodeId: string, pinId: string, side: PinSide,
-  nodes: CircuitNode[], junctions: Junction[],
-): Vec2 | null {
-  const j = junctions.find((x) => x.id === nodeId)
-  if (j) return j.point
-  const n = nodes.find((x) => x.id === nodeId)
-  if (!n) return null
-  return pinAnchor(n, { side, pinId })
-}
-
-function pinAnchor(n: CircuitNode, w: { side: PinSide; pinId: string }): Vec2 | null {
-  if (w.side === 'out') {
-    const i = n.outputs.findIndex((p) => p.id === w.pinId)
-    return i >= 0 ? rightPinPos(n, i) : null
+function clipCursorToNodes(
+  last: Vec2, target: Vec2, nodes: CircuitNode[], ignoreIds?: Set<string>,
+): Vec2 {
+  if (!pointInAnyNode(target, nodes, ignoreIds)) return target
+  let lo = 0, hi = 1
+  for (let iter = 0; iter < 20; iter++) {
+    const mid = (lo + hi) / 2
+    const p = { x: last.x + (target.x - last.x) * mid, y: last.y + (target.y - last.y) * mid }
+    if (pointInAnyNode(p, nodes, ignoreIds)) hi = mid
+    else lo = mid
   }
-  const i = n.inputs.findIndex((p) => p.id === w.pinId)
-  return i >= 0 ? leftPinPos(n, i) : null
-}
-
-function wireView(w: Wire, nodes: CircuitNode[], junctions: Junction[]): { pts: Vec2[] } | null {
-  const a = anchorOf(w.from.nodeId, w.from.pinId, w.from.side, nodes, junctions)
-  const b = anchorOf(w.to.nodeId, w.to.pinId, w.to.side, nodes, junctions)
-  if (!a || !b) return null
-  const stored = w.points?.length ? w.points : [a, b]
-  const pts = stored.map(snapWirePoint)
-  pts[0] = { ...a }
-  pts[pts.length - 1] = { ...b }
-  return { pts: ensureOrthogonalPolyline(pts) }
+  const boundary = { x: last.x + (target.x - last.x) * lo, y: last.y + (target.y - last.y) * lo }
+  return snapWirePoint(boundary)
 }
 
 function drawBody(
@@ -929,7 +1072,6 @@ function drawNode(
     return
   }
 
-  // gates
   drawBody(ctx, n, fill, edge, selected, zoom, theme)
   const cx = n.position.x + b.w / 2, cy = n.position.y + b.h / 2
   const glyph = GATE_GLYPH[n.kind] ?? '?'
@@ -943,7 +1085,11 @@ function drawNode(
   ctx.restore()
 }
 
-function drawPin(ctx: CanvasRenderingContext2D, x: number, y: number, high: boolean, zoom: number, theme: Theme) {
+function drawPin(
+  ctx: CanvasRenderingContext2D, x: number, y: number,
+  high: boolean, zoom: number, theme: Theme, connected: boolean,
+) {
+  if (connected) return
   ctx.beginPath(); ctx.arc(x, y, PIN_R, 0, Math.PI * 2)
   ctx.fillStyle = high ? theme.pinHigh : (theme.body === '#ffffff' ? '#e2e8f0' : '#52525b')
   ctx.fill()
@@ -1043,12 +1189,8 @@ function drawUnfoldedChip(
     return
   }
   const { translated } = layout
-  const byId = new Map(translated.map((cn) => [cn.id, cn]))
 
   for (const w of chip.wires) {
-    const from = byId.get(w.from.nodeId)
-    const to = byId.get(w.to.nodeId)
-    if (!from || !to) continue
     const vw = wireView(w, translated, [])
     if (!vw) continue
     ctx.strokeStyle = theme.wireLow
@@ -1062,7 +1204,7 @@ function drawUnfoldedChip(
   }
   for (const cn of translated) {
     for (const pin of enumeratePins(cn)) {
-      drawPin(ctx, pin.pos.x, pin.pos.y, !!signal[pinKey(pin.nodeId, pin.pinId)], zoom, theme)
+      drawPin(ctx, pin.pos.x, pin.pos.y, !!signal[pinKey(pin.nodeId, pin.pinId)], zoom, theme, false)
     }
   }
 }
@@ -1114,8 +1256,20 @@ function computeBridgeCrossings(
       result.push({ point, overWireId: v.wireId, underWireId: h.wireId })
     }
   }
-
   return result
+}
+
+function computeConnectedTerminals(wires: Wire[], junctions: Junction[]): Set<string> {
+  const s = new Set<string>()
+  for (const w of wires) {
+    s.add(pinKey(w.from.nodeId, w.from.pinId))
+    s.add(pinKey(w.to.nodeId, w.to.pinId))
+  }
+  for (const j of junctions) {
+    s.add(pinKey(j.id, 'out'))
+    s.add(pinKey(j.id, 'in'))
+  }
+  return s
 }
 
 function drawScene(
@@ -1141,16 +1295,15 @@ function drawScene(
   const wr = (sw - offsetX) / zoom, wb = (sh - offsetY) / zoom
   drawGrid(ctx, wl, wt, wr, wb, zoom, theme.grid)
 
-  const wireActive = (w: Wire) => !!signal[pinKey(w.from.nodeId, w.from.pinId)]
+  const connectedTerminals = computeConnectedTerminals(wires, junctions)
 
   const wirePolys: { w: Wire; pts: Vec2[]; high: boolean; hover: boolean; isSel: boolean }[] = []
   for (const w of wires) {
     const vw = wireView(w, nodes, junctions)
     if (!vw) continue
+    const high = !!signal[pinKey(w.from.nodeId, w.from.pinId)]
     wirePolys.push({
-      w,
-      pts: vw.pts,
-      high: wireActive(w),
+      w, pts: vw.pts, high,
       hover: hoverWireId === w.id,
       isSel: selectedWireId === w.id || selectedWireIds.has(w.id),
     })
@@ -1249,16 +1402,7 @@ function drawScene(
     ctx.setLineDash([])
   }
 
-  for (const j of junctions) {
-    const active = !!signal[pinKey(j.id, 'out')]
-    ctx.beginPath()
-    ctx.arc(j.point.x, j.point.y, 4.2 / zoom + 1, 0, Math.PI * 2)
-    ctx.fillStyle = active ? theme.wireHigh : theme.wireLow
-    ctx.fill()
-    ctx.lineWidth = 1.4 / zoom
-    ctx.strokeStyle = theme.bg
-    ctx.stroke()
-  }
+  // No junction dots. No wire-body dots. Pure vector polylines only.
 
   for (const n of nodes) {
     if (n.kind === 'CHIP' && n.unfolded && n.chipId && chipById[n.chipId]) {
@@ -1268,8 +1412,10 @@ function drawScene(
     drawNode(ctx, n, selected.has(n.id), signal, chipMeta, zoom, theme, dark)
   }
   for (const n of nodes) {
-    for (const pin of enumeratePins(n))
-      drawPin(ctx, pin.pos.x, pin.pos.y, !!signal[pinKey(pin.nodeId, pin.pinId)], zoom, theme)
+    for (const pin of enumeratePins(n)) {
+      const connected = connectedTerminals.has(pinKey(pin.nodeId, pin.pinId))
+      drawPin(ctx, pin.pos.x, pin.pos.y, !!signal[pinKey(pin.nodeId, pin.pinId)], zoom, theme, connected)
+    }
   }
 
   if (drawingPreview && drawingPreview.pts.length >= 2) {
@@ -1279,15 +1425,12 @@ function drawScene(
     strokeWirePath(ctx, drawingPreview.pts)
     ctx.stroke()
     ctx.setLineDash([])
-    const end = drawingPreview.pts[drawingPreview.pts.length - 1]
-    ctx.beginPath(); ctx.arc(end.x, end.y, 3.5 / zoom, 0, Math.PI * 2)
-    ctx.fillStyle = theme.wireHigh; ctx.fill()
   }
 
   if (placingNode) {
     drawNode(ctx, placingNode, false, {}, chipMeta, zoom, theme, dark, 0.62)
     for (const pin of enumeratePins(placingNode))
-      drawPin(ctx, pin.pos.x, pin.pos.y, false, zoom, theme)
+      drawPin(ctx, pin.pos.x, pin.pos.y, false, zoom, theme, false)
   }
 
   if (box && (Math.abs(box.w) > 2 || Math.abs(box.h) > 2)) {
@@ -1335,13 +1478,16 @@ function renderNodesToImage(
 }
 
 /* Persistence */
-const STORAGE_KEY = 'logicmaker.v2'
+const STORAGE_KEY = 'logicmaker.v5'
 interface SavedState {
   nodes: CircuitNode[]; wires: Wire[]; junctions?: Junction[]
   chips: ChipDefinition[]; camera: Camera; dark?: boolean
 }
 function loadState(): Partial<SavedState> {
-  try { const raw = localStorage.getItem(STORAGE_KEY); return raw ? JSON.parse(raw) : {} } catch { return {} }
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    return raw ? JSON.parse(raw) : {}
+  } catch { return {} }
 }
 function saveState(s: SavedState) {
   try {
@@ -1358,7 +1504,7 @@ type DragMode =
   | { kind: 'box'; startX: number; startY: number; endX: number; endY: number }
   | null
 
-export default function LogicMaker() {
+export default function LogicSimulator() {
   const saved = useMemo(() => loadState(), [])
   const [nodes, setNodes] = useState<CircuitNode[]>(saved.nodes ?? [])
   const [wires, setWires] = useState<Wire[]>(saved.wires ?? [])
@@ -1412,17 +1558,22 @@ export default function LogicMaker() {
     }
     bridgeCrossings.current = computeBridgeCrossings(wirePolys, junctions)
   }, [wires, nodes, junctions])
+
   useEffect(() => {
     modalOpen.current = !!(createModal || clockModal || renamePinModal || changeBlockModal)
   }, [createModal, clockModal, renamePinModal, changeBlockModal])
 
   const simulator = useMemo(() => new Simulator(), [])
   const chipsById = useMemo(() => Object.fromEntries(chips.map((c) => [c.id, c])), [chips])
-  const compiled = useMemo(
-    () => compileCircuit({ nodes, wires }, chipsById, junctions),
-    [nodes, wires, chipsById, junctions],
+
+  const netModel = useMemo(
+    () => buildNetModel(nodes, wires, junctions, chipsById),
+    [nodes, wires, junctions, chipsById],
   )
-  simulator.load(compiled)
+
+  useEffect(() => {
+    simulator.load(netModel)
+  }, [netModel, simulator])
 
   useEffect(() => {
     if (!hasLoaded.current) { hasLoaded.current = true; return }
@@ -1521,7 +1672,7 @@ export default function LogicMaker() {
 
   const findPinAt = (p: Vec2, extraGrab = 0) => {
     let best: EnumeratedPin | null = null, bestD = Infinity
-    const grab = (PIN_R + 7) / live.current.camera.zoom + extraGrab
+    const grab = PIN_SNAP_RADIUS / live.current.camera.zoom + extraGrab
     for (const n of live.current.nodes)
       for (const pin of enumeratePins(n)) {
         const d = Math.hypot(p.x - pin.pos.x, p.y - pin.pos.y)
@@ -1543,7 +1694,7 @@ export default function LogicMaker() {
   }
   const findHoveredWire = (p: Vec2) => {
     const zoom = live.current.camera.zoom
-    let best: string | null = null, bestD = 14 / zoom
+    let best: string | null = null, bestD = WIRE_SNAP_RADIUS / zoom
     for (const w of live.current.wires) {
       const vw = wireView(w, live.current.nodes, live.current.junctions)
       if (!vw) continue
@@ -1653,6 +1804,11 @@ export default function LogicMaker() {
 
   const cancelDrawing = () => { drawing.current = null }
 
+  /**
+   * Finish drawing. If the endpoint lands on an existing wire's body
+   * (but no explicit junction), auto-create a junction so the two wires
+   * electrically merge into one net.
+   */
   const finishDrawing = (nodeId: string, pinId: string, side: PinSide, endPoint?: Vec2) => {
     const d = drawing.current
     if (!d) return
@@ -1718,7 +1874,7 @@ export default function LogicMaker() {
 
     if (drawing.current) {
       const d = drawing.current
-      const pinHit = findPinAt(p, 10)
+      const pinHit = findPinAt(p, 8)
       if (pinHit && isValidWireTarget(pinHit, d.from)) {
         finishDrawing(pinHit.nodeId, pinHit.pinId, pinHit.side, pinHit.pos)
         return
@@ -1729,11 +1885,12 @@ export default function LogicMaker() {
         const j = pt ? createJunctionOnWire(wireHitId, pt) : null
         if (j) { finishDrawing(j.id, 'j', 'in', j.point); return }
       }
-      const committed = snapWirePoint(p)
-      d.points = addOrthogonalAnchor(d.points, committed, d.preferH)
-      d.cursor = committed
+      const last = d.points[d.points.length - 1]
+      const clipped = clipCursorToNodes(last, snapWirePoint(p), live.current.nodes)
+      d.points = addOrthogonalAnchor(d.points, clipped, d.preferH)
+      d.cursor = clipped
       d.preferH = null
-      mousePos.current = committed
+      mousePos.current = clipped
       return
     }
 
@@ -1828,38 +1985,41 @@ export default function LogicMaker() {
 
     if (drawing.current) {
       const d = drawing.current
-      const magnetPin = findPinAt(p, 12)
+      const magnetPin = findPinAt(p, 8)
       let target: Vec2
       if (magnetPin && isValidWireTarget(magnetPin, d.from)) {
         target = snapWirePoint(magnetPin.pos)
       } else {
         target = snapWirePoint(p)
       }
+      const last = d.points[d.points.length - 1]
+      const clippedTarget = clipCursorToNodes(last, target, live.current.nodes)
+
       const previousCursor = d.cursor
-      mousePos.current = target
+      mousePos.current = clippedTarget
 
       if (d.preferH === null && d.points.length >= 1) {
-        const last = d.points[d.points.length - 1]
-        const adx = Math.abs(target.x - last.x)
-        const ady = Math.abs(target.y - last.y)
+        const lastPt = d.points[d.points.length - 1]
+        const adx = Math.abs(clippedTarget.x - lastPt.x)
+        const ady = Math.abs(clippedTarget.y - lastPt.y)
         const THRESH = HALF_GRID
         if (adx >= THRESH || ady >= THRESH) {
           d.preferH = adx >= ady
         }
       }
 
-      const cursorMoved = previousCursor.x !== target.x || previousCursor.y !== target.y
+      const cursorMoved = previousCursor.x !== clippedTarget.x || previousCursor.y !== clippedTarget.y
       if (cursorMoved && d.points.length > 1) {
         for (let i = d.points.length - 1; i >= 1; i--) {
           const wp = d.points[i]
-          if (wp.x === target.x && wp.y === target.y) {
+          if (wp.x === clippedTarget.x && wp.y === clippedTarget.y) {
             d.points = d.points.slice(0, i)
             d.preferH = null
             break
           }
         }
       }
-      d.cursor = target
+      d.cursor = clippedTarget
       return
     }
 
@@ -1893,7 +2053,7 @@ export default function LogicMaker() {
       const r = canvasRect()
       const p = screenToWorld(e.clientX - r.left, e.clientY - r.top)
       const d = drawing.current
-      const pinHit = findPinAt(p, 12)
+      const pinHit = findPinAt(p, 16)
       if (pinHit && isValidWireTarget(pinHit, d.from)) {
         finishDrawing(pinHit.nodeId, pinHit.pinId, pinHit.side, pinHit.pos)
       }
@@ -2283,7 +2443,6 @@ export default function LogicMaker() {
   }
 
   const onDoubleClick = (e: React.MouseEvent) => {
-    // Double-click while drawing cancels the session.
     if (drawing.current) { cancelDrawing(); return }
     if (placement) return
     const p = screenToWorld(e.clientX - canvasRect().left, e.clientY - canvasRect().top)
@@ -2403,7 +2562,22 @@ export default function LogicMaker() {
   }
 
   const exportJSON = () => {
-    const data = { version: 2, nodes, wires, junctions, chips: chips.filter((c) => !c.builtin), camera, dark }
+    const model = buildNetModel(nodes, wires, junctions, chipsById)
+    const adjacency: Record<string, string[]> = {}
+    for (const [key, root] of model.terminalNet) {
+      if (!adjacency[root]) adjacency[root] = []
+      adjacency[root].push(key)
+    }
+    const data = {
+      version: 5,
+      nodes,
+      wires,
+      junctions,
+      chips: chips.filter((c) => !c.builtin),
+      camera,
+      dark,
+      netAdjacency: adjacency,
+    }
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a'); a.href = url; a.download = `LogicMaker_${Date.now()}.json`; a.click()
@@ -2552,7 +2726,9 @@ export default function LogicMaker() {
       let drawingPreview: { fromPos: Vec2; pts: Vec2[] } | null = null
       if (drawing.current) {
         const d = drawing.current
-        const pts = orthogonalPathTo(d.points, mousePos.current, d.preferH)
+        const last = d.points[d.points.length - 1]
+        const clippedCursor = clipCursorToNodes(last, mousePos.current, s.nodes)
+        const pts = orthogonalPathTo(d.points, clippedCursor, d.preferH)
         drawingPreview = { fromPos: d.fromPos, pts }
       }
 
@@ -2974,7 +3150,7 @@ export default function LogicMaker() {
             <h2 className="mb-1 text-sm font-semibold">Change Component</h2>
             <p className="mb-3 text-[11px] opacity-60">Wires are re-mapped by pin index. Label resets to the new default.</p>
 
-            <div className="max-h-[280px] overflow-y-auto pr-1">
+            <div className="max-h-70 overflow-y-auto pr-1">
               <div className="mb-1 px-1 text-[10px] font-semibold uppercase tracking-wider opacity-50">I/O</div>
               <div className="mb-3 flex flex-col gap-0.5">
                 {IO_BLOCKS.map((k) => (
