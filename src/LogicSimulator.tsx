@@ -30,23 +30,42 @@ import {
 } from 'lucide-react'
 
 /* =====================================================================
- *  LogicSimulator — v7
+ *  LogicSimulator — v8
  *  ---------------------------------------------------------------------
  *  NEW IN THIS VERSION:
- *   [1] Strict mathematical pin-grid formula:
- *         N_max = max(N_inputs, N_outputs)
- *         H_grid = 2·N_max + 1        (component height in grid units)
- *         C_grid = N_max + 1          (vertical center grid index)
- *         Y_start = N_max - k + 2     (first pin grid index for k pins)
- *         pins at Y_start, Y_start+2, …, Y_start+2(k-1)
- *       → All pins land on integer grid nodes; centered outputs align.
- *   [2] Lead-out stubs are exactly 1·GRID_SIZE long, anchored on the box
- *       wall, so the outer tip lands on the adjacent grid intersection.
- *   [3] Wire-draft collision now uses Line-Segment vs AABB (slab method)
- *       raycasting: preview truncates at the entry boundary of ANY
- *       component box.  Wires can no longer pass through a component.
- *   [4] Node width is rounded up to GRID so right-edge lead-out tips are
- *       also grid-aligned.
+ *
+ *   [1] UNIVERSAL MATHEMATICAL PIN PLACEMENT ENGINE
+ *       Single unified formula applied to every component type:
+ *
+ *         N_max  = max(N_inputs, N_outputs)
+ *         Height = 2 · N_max · GRID_SIZE          (spans grid nodes 0..2·N_max)
+ *         Center = N_max · GRID_SIZE
+ *
+ *         For a side with k pins:
+ *           y_i = (N_max − k + 1) + 2·i        (grid index, i = 0..k−1)
+ *         Pin pixel Y = position.y + y_i · GRID_SIZE
+ *
+ *       Verified examples:
+ *         2-in / 1-out  (N=2):  in@{1,3}, out@{2}   — output perfectly centered
+ *         3-in / 2-out  (N=3):  in@{1,3,5}, out@{2,4}
+ *         2-in / 3-out  (N=3):  in@{2,4}, out@{1,3,5}
+ *         3-in / 4-out  (N=4):  in@{2,4,6}, out@{1,3,5,7}
+ *
+ *       No conditionals, no per-type padding — one formula for everyone.
+ *
+ *   [2] LEAD-OUT STUBS
+ *       Root exactly on the box border, length = 1 · GRID_SIZE, so the
+ *       tip lands precisely on the adjacent grid intersection.
+ *
+ *   [3] SEGMENT-BASED CORRIDOR UNFREEZING
+ *       The wire preview's dynamic L-shape is checked segment-by-segment
+ *       against every component's AABB.
+ *         • Segment A (horizontal dog-leg)  → tested
+ *         • Segment B (vertical final leg)  → tested
+ *       If NEITHER segment intersects a box, the preview renders the full
+ *       L-shape immediately (UNFREEZE).  Only a real segment-vs-AABB hit
+ *       truncates the draft at the entry boundary.
+ *       This removes the previous "stuck-forever" freeze.
  * ===================================================================== */
 
 type PinSide = 'in' | 'out'
@@ -134,15 +153,15 @@ const isPinRefEqual = (a: PinRef, b: PinRef) =>
   a.nodeId === b.nodeId && a.pinId === b.pinId && a.side === b.side
 
 /* --------------------------- Geometry --------------------------------
- *  GRID = 16 (routing grid; pins & box edges are always on this grid)
- *  SUB_GRID = 8 (fine snapping for wire corners)
- *  LEADOUT = 1·GRID (lead-out stub length; outer tip = adjacent node)
+ *  GRID = 16 (routing grid — pins, walls, lead-out tips all on this grid)
+ *  SUB_GRID = 8 (fine snapping for wire corner bends)
+ *  LEADOUT = 1 full GRID unit (stub protrudes to the adjacent grid node)
  * -------------------------------------------------------------------- */
 const GRID = 16
 const SUB_GRID = 8
-const NODE_W_MIN = 96         // multiple of GRID
+const NODE_W_MIN = 96           // multiple of GRID
 const PIN_R = 4.5
-const LEADOUT = GRID          // stub length = exactly 1 grid unit
+const LEADOUT = GRID            // stub length = exactly 1 grid unit
 const MIN_ZOOM = 0.05
 const MAX_ZOOM = 4
 const WIRE_CLEARANCE = 2
@@ -163,32 +182,25 @@ function approxLabelWidth(label: string): number {
   return Math.ceil(label.length * 5.6) + 40
 }
 
-/**
- * N_max = max(N_inputs, N_outputs, 1)
- * The strict pin-grid formula uses this everywhere.
- */
+/** N_max = max(N_inputs, N_outputs, 1) — the single source of truth. */
 const NmaxOf = (n: CircuitNode) =>
   Math.max(n.inputs.length, n.outputs.length, 1)
 
 /**
- * Component height in pixels.
- *   H_grid  = 2·N_max + 1
- *   height  = H_grid · GRID_SIZE
- * Total height is always a multiple of GRID, guaranteeing that every
- * pin row (which sits at grid indices) lands on an integer grid node.
- *
- * Examples:
- *   2 inputs / 1 output  → H_grid = 5 → 80 px
- *   1 input  / 1 output  → H_grid = 3 → 48 px
+ * UNIVERSAL HEIGHT FORMULA
+ *   H_units = 2 · N_max         (grid intervals)
+ *   height  = H_units · GRID    (pixels)
+ * Box spans grid nodes y = 0 .. 2·N_max.
+ * Center grid node C = N_max.
  */
 const nodeHeight = (n: CircuitNode) => {
   if (n.kind === 'CHIP' && n.unfolded && n.unfoldedSize) return n.unfoldedSize.h
   const N = NmaxOf(n)
-  return (2 * N + 1) * GRID
+  return 2 * N * GRID
 }
 
 /**
- * Component width. Rounded up to GRID so the right-edge lead-out tip
+ * Component width — rounded up to GRID so the right-edge lead-out tip
  * (box.x + box.w + LEADOUT) also lands on a grid intersection.
  */
 const nodeWidth = (n: CircuitNode) => {
@@ -214,15 +226,14 @@ const nodeBox = (n: CircuitNode) => ({
 })
 
 /**
- * Compute the pin's outer anchor position — the tip of the lead-out
- * stub, which is where wires attach.
+ * UNIVERSAL PIN PLACEMENT FORMULA
+ *   For a side with k pins:
+ *     y_i = (N_max − k + 1) + 2·i       (grid index, i = 0..k−1)
+ *   Pin pixel position = position.y + y_i · GRID_SIZE
+ * If k = 0, no pins are produced.
  *
- * Grid formula (independent of which edge we're on):
- *   gridIndex = N_max − k + 2 + 2·index
- *   along-edge offset = gridIndex · GRID
- *
- * Horizontal edges (left/right): offset is along Y.
- * Vertical edges (top/bottom, i.e. rotated): offset is along X.
+ * The pin's outer anchor (where wires attach) is one LEADOUT beyond the
+ * box wall on the pin's edge.
  */
 function pinPos(n: CircuitNode, side: PinSide, index: number, count: number): Vec2 {
   if (n.kind === 'CHIP' && n.unfolded && n.unfoldedPinPos) {
@@ -239,14 +250,15 @@ function pinPos(n: CircuitNode, side: PinSide, index: number, count: number): Ve
   else edge = side === 'in' ? 'left' : 'right'
 
   const N = NmaxOf(n)
-  const gridIndex = N - count + 2 + 2 * index
+  // Universal formula: y_i = (N_max − k + 1) + 2·i
+  const yIdx = (N - count + 1) + 2 * index
 
   if (edge === 'left' || edge === 'right') {
     const outerX = edge === 'left' ? b.x - LEADOUT : b.x + b.w + LEADOUT
-    return { x: outerX, y: b.y + gridIndex * GRID }
+    return { x: outerX, y: b.y + yIdx * GRID }
   }
   const outerY = edge === 'top' ? b.y - LEADOUT : b.y + b.h + LEADOUT
-  return { x: b.x + gridIndex * GRID, y: outerY }
+  return { x: b.x + yIdx * GRID, y: outerY }
 }
 
 /** The point on the box wall where the lead-out stub attaches. */
@@ -640,7 +652,6 @@ function buildNetModel(
     }
   }
 
-  // AUTO-JUNCTION: wire endpoints landing on another wire's body merge.
   const wireGeom: { w: Wire; pts: Vec2[] }[] = []
   for (const w of wires) {
     const vw = wireView(w, nodes, junctions)
@@ -979,6 +990,50 @@ function addOrthogonalAnchor(points: Vec2[], next: Vec2, preferH: boolean | null
   return orthogonalPathTo(points, next, preferH)
 }
 
+/* ---------------------------------------------------------------------
+ *  LINE-SEGMENT vs AABB (slab method)
+ *  Returns the FIRST entry point along a→b, with parameter t ∈ [0,1],
+ *  or null if the segment never enters the box.
+ * ------------------------------------------------------------------- */
+function segmentAABBIntersect(
+  a: Vec2, b: Vec2,
+  box: { x: number; y: number; w: number; h: number },
+): { pt: Vec2; t: number } | null {
+  const minX = box.x
+  const maxX = box.x + box.w
+  const minY = box.y
+  const maxY = box.y + box.h
+
+  // If the start point is already inside the box, return immediately.
+  if (a.x >= minX && a.x <= maxX && a.y >= minY && a.y <= maxY) {
+    return { pt: { x: a.x, y: a.y }, t: 0 }
+  }
+
+  const dx = b.x - a.x
+  const dy = b.y - a.y
+
+  let tmin = 0
+  let tmax = 1
+  const p = [-dx, dx, -dy, dy]
+  const q = [a.x - minX, maxX - a.x, a.y - minY, maxY - a.y]
+
+  for (let i = 0; i < 4; i++) {
+    if (p[i] === 0) {
+      if (q[i] < 0) return null
+    } else {
+      const t = q[i] / p[i]
+      if (p[i] < 0) {
+        if (t > tmin) tmin = t
+      } else {
+        if (t < tmax) tmax = t
+      }
+    }
+  }
+
+  if (tmin > tmax) return null
+  return { pt: { x: a.x + tmin * dx, y: a.y + tmin * dy }, t: tmin }
+}
+
 /** Is the point inside any node's rectangle (with clearance)? */
 function pointInAnyNode(p: Vec2, nodes: CircuitNode[], ignoreIds?: Set<string>): boolean {
   for (const n of nodes) {
@@ -995,126 +1050,102 @@ function pointInAnyNode(p: Vec2, nodes: CircuitNode[], ignoreIds?: Set<string>):
 }
 
 /**
- * Slab-method Line Segment vs Axis-Aligned Bounding Box intersection.
- * Returns the first entry point (from a toward b) with its parameter t∈[0,1],
- * or null if no intersection.
+ * SEGMENT-BASED CORRIDOR TRUNCATION.
+ * Takes a proposed polyline starting at `pts[0]` and walks segments one
+ * by one, testing each against every component AABB.  The first segment
+ * that hits a box is truncated at the entry boundary point (pulled back
+ * a hair so the endpoint is strictly outside); any remaining segments
+ * are dropped.
+ *
+ * When no segment hits, the WHOLE polyline is preserved → the preview
+ * renders the full L-shape (this is the "unfreeze" behaviour).
  */
-function segmentAABBIntersect(
-  a: Vec2, b: Vec2,
-  box: { x: number; y: number; w: number; h: number },
-): { pt: Vec2; t: number } | null {
-  const minX = box.x
-  const maxX = box.x + box.w
-  const minY = box.y
-  const maxY = box.y + box.h
-
-  // If the start point is already inside the box, it's an immediate hit.
-  if (a.x >= minX && a.x <= maxX && a.y >= minY && a.y <= maxY) {
-    return { pt: { x: a.x, y: a.y }, t: 0 }
-  }
-
-  const dx = b.x - a.x
-  const dy = b.y - a.y
-
-  let tmin = 0
-  let tmax = 1
-  const p = [-dx, dx, -dy, dy]
-  const q = [a.x - minX, maxX - a.x, a.y - minY, maxY - a.y]
-
-  for (let i = 0; i < 4; i++) {
-    if (p[i] === 0) {
-      // Parallel to this slab; if outside, no intersection.
-      if (q[i] < 0) return null
-    } else {
-      const t = q[i] / p[i]
-      if (p[i] < 0) {
-        if (t > tmin) tmin = t
-      } else {
-        if (t < tmax) tmax = t
-      }
-    }
-  }
-
-  if (tmin > tmax) return null
-  return { pt: { x: a.x + tmin * dx, y: a.y + tmin * dy }, t: tmin }
-}
-
-/**
- * Strict boundary blocking via Line-Segment vs AABB:
- * Cast the segment [last → target] against every component box.
- * If it intersects, return the entry boundary point (pulled back a hair
- * so the endpoint sits just outside the wall).
- */
-function clipCursorToNodes(
-  last: Vec2, target: Vec2, nodes: CircuitNode[], ignoreIds?: Set<string>,
-): Vec2 {
-  let best: { pt: Vec2; t: number } | null = null
-
-  for (const n of nodes) {
-    if (ignoreIds?.has(n.id)) continue
-    const b = nodeBox(n)
-    const expanded = {
-      x: b.x - WIRE_CLEARANCE,
-      y: b.y - WIRE_CLEARANCE,
-      w: b.w + 2 * WIRE_CLEARANCE,
-      h: b.h + 2 * WIRE_CLEARANCE,
-    }
-    const hit = segmentAABBIntersect(last, target, expanded)
-    if (hit && (!best || hit.t < best.t)) best = hit
-  }
-
-  if (!best) return target
-
-  // Pull back slightly along the direction of travel so the endpoint is
-  // strictly outside the collision envelope.
-  const dx = target.x - last.x
-  const dy = target.y - last.y
-  const len = Math.hypot(dx, dy) || 1
-  const back = 0.5
-  return {
-    x: best.pt.x - (dx / len) * back,
-    y: best.pt.y - (dy / len) * back,
-  }
-}
-
-/**
- * Truncate an entire orthogonal polyline (segment by segment) at the first
- * component-box entry point. Used to keep the L-shaped preview from
- * clipping through boxes when the direct segment [last → cursor] does not
- * itself intersect (but the orthogonalised dog-leg does).
- */
-function clipPolylineToNodes(
-  points: Vec2[], nodes: CircuitNode[], ignoreIds?: Set<string>,
+function truncatePolylineOnCollision(
+  pts: Vec2[],
+  nodes: CircuitNode[],
+  ignoreNodeId?: string,
 ): Vec2[] {
-  if (points.length < 2) return points.map((p) => ({ ...p }))
-  const out: Vec2[] = [{ ...points[0] }]
+  if (pts.length < 2) return pts.map((p) => ({ ...p }))
+  const out: Vec2[] = [{ ...pts[0] }]
 
-  for (let i = 1; i < points.length; i++) {
+  for (let i = 1; i < pts.length; i++) {
     const a = out[out.length - 1]
-    const b = points[i]
+    const b = pts[i]
     let best: { pt: Vec2; t: number } | null = null
+
     for (const n of nodes) {
-      if (ignoreIds?.has(n.id)) continue
+      if (n.id === ignoreNodeId) continue
       const box = nodeBox(n)
-      const expanded = {
+      const inflated = {
         x: box.x - WIRE_CLEARANCE,
         y: box.y - WIRE_CLEARANCE,
         w: box.w + 2 * WIRE_CLEARANCE,
         h: box.h + 2 * WIRE_CLEARANCE,
       }
-      const hit = segmentAABBIntersect(a, b, expanded)
-      if (hit && hit.t > 0 && hit.t <= 1 && (!best || hit.t < best.t)) best = hit
+      const hit = segmentAABBIntersect(a, b, inflated)
+      if (hit && hit.t > 1e-3 && (!best || hit.t < best.t)) best = hit
     }
+
     if (best) {
-      const dx = b.x - a.x, dy = b.y - a.y
+      const dx = b.x - a.x
+      const dy = b.y - a.y
       const len = Math.hypot(dx, dy) || 1
       const back = 0.5
-      out.push({ x: best.pt.x - (dx / len) * back, y: best.pt.y - (dy / len) * back })
+      out.push({
+        x: best.pt.x - (dx / len) * back,
+        y: best.pt.y - (dy / len) * back,
+      })
       return out
     }
     out.push({ ...b })
   }
   return out
+}
+
+/**
+ * Build the dynamic preview polyline for an active wire draft:
+ *   fixedPoints = committed polyline so far (starts at fromPos)
+ *   mouse       = current raw cursor position (world)
+ *   preferH     = forced first-segment direction, or null for auto
+ *
+ * The L-shape (dog-leg + final leg) is then run through the segment
+ * collision engine.  If neither of the two dynamic segments hits a box,
+ * the full L-shape is returned unchanged — this is the "unfreeze".
+ */
+function buildPreviewPolyline(
+  fixedPoints: Vec2[],
+  mouse: Vec2,
+  preferH: boolean | null,
+  nodes: CircuitNode[],
+  ignoreNodeId: string,
+): Vec2[] {
+  const last = fixedPoints[fixedPoints.length - 1]
+  const target = snapWirePoint(mouse)
+  const dx = target.x - last.x
+  const dy = target.y - last.y
+
+  // Degenerate: straight horizontal or vertical.
+  if (Math.abs(dx) <= 0.5 || Math.abs(dy) <= 0.5) {
+    const raw = [{ ...last }, target]
+    return truncatePolylineOnCollision(raw, nodes, ignoreNodeId)
+  }
+
+  // Choose first-segment orientation.
+  let useH: boolean
+  if (preferH !== null) useH = preferH
+  else if (fixedPoints.length >= 2) {
+    const prev = fixedPoints[fixedPoints.length - 2]
+    useH = Math.abs(prev.y - last.y) <= 0.5
+  } else {
+    useH = Math.abs(dx) >= Math.abs(dy)
+  }
+
+  const corner = useH
+    ? { x: target.x, y: last.y }
+    : { x: last.x, y: target.y }
+
+  const raw = [{ ...last }, corner, target]
+  return truncatePolylineOnCollision(raw, nodes, ignoreNodeId)
 }
 
 function drawBody(
@@ -1154,7 +1185,8 @@ function drawNode(
     const value = (n.kind === 'CLOCK')
       ? (n.enabled === false ? false : !!signal[pinKey(n.id, 'out')])
       : !!n.value
-    const btnW = 48, btnH = 26
+    const btnW = 48
+    const btnH = Math.min(26, b.h - 6)
     const nw = nodeWidth(n)
     const bx = n.position.x + nw - btnW - 14
     const by = n.position.y + (b.h - btnH) / 2
@@ -1240,18 +1272,20 @@ function drawNode(
     return
   }
 
-  // Standard gate
+  // Standard gate — glyph + label scaled to box height.
   drawBody(ctx, n, fill, edge, selected, zoom, theme)
   const cx = n.position.x + b.w / 2
-  const labelY = n.position.y + 14
-  const glyphY = n.position.y + b.h / 2 + 4
+  const labelY = n.position.y + Math.min(14, b.h * 0.28)
+  const glyphY = n.position.y + b.h * 0.58
+  const glyphSize = Math.min(26, b.h * 0.55)
+  const labelSize = Math.max(8, Math.min(10, b.h * 0.22))
   const glyph = GATE_GLYPH[n.kind] ?? '?'
   ctx.fillStyle = edge ?? theme.edge
-  ctx.font = '800 26px ui-sans-serif, system-ui, sans-serif'
+  ctx.font = `800 ${glyphSize}px ui-sans-serif, system-ui, sans-serif`
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
   ctx.fillText(glyph, cx, glyphY)
   ctx.fillStyle = theme.label
-  ctx.font = '600 10px ui-sans-serif, system-ui, sans-serif'
+  ctx.font = `600 ${labelSize}px ui-sans-serif, system-ui, sans-serif`
   ctx.fillText(n.label, cx, labelY)
   ctx.restore()
 }
@@ -1264,7 +1298,7 @@ function drawPin(
   dark: boolean,
 ) {
   const { pos, innerPos } = pin
-  // Lead-out stub: a 1·GRID line from the box wall to the outer anchor.
+  // Lead-out stub: exactly 1·GRID long from the wall to the outer anchor.
   ctx.strokeStyle = connected ? (high ? theme.wireHigh : theme.wireLow)
     : (dark ? '#71717a' : '#94a3b8')
   ctx.lineWidth = connected
@@ -1672,7 +1706,7 @@ function renderNodesToImage(
 }
 
 /* Persistence */
-const STORAGE_KEY = 'logicmaker.v7'
+const STORAGE_KEY = 'logicmaker.v8'
 interface SavedState {
   nodes: CircuitNode[]; wires: Wire[]; junctions?: Junction[]
   chips: ChipDefinition[]; camera: Camera; dark?: boolean
@@ -2076,12 +2110,13 @@ export default function LogicSimulator() {
         const j = pt ? createJunctionOnWire(wireHitId, pt) : null
         if (j) { finishDrawing(j.id, 'j', 'in', j.point); return }
       }
-      const last = d.points[d.points.length - 1]
-      const clipped = clipCursorToNodes(last, snapWirePoint(p), live.current.nodes)
-      d.points = addOrthogonalAnchor(d.points, clipped, d.preferH)
-      d.cursor = clipped
+      // Commit current preview (collision-truncated) as the new fixed polyline.
+      const raw = snapWirePoint(p)
+      const preview = buildPreviewPolyline(d.points, raw, d.preferH, live.current.nodes, d.from.nodeId)
+      d.points = [...d.points.slice(0, -1), ...preview]
+      d.cursor = d.points[d.points.length - 1]
       d.preferH = null
-      mousePos.current = clipped
+      mousePos.current = d.cursor
       return
     }
 
@@ -2095,7 +2130,8 @@ export default function LogicSimulator() {
 
     if (node) {
       if (node.kind === 'INPUT' || node.kind === 'BUTTON' || node.kind === 'CLOCK') {
-        const btnW = 48, btnH = 26
+        const btnW = 48
+        const btnH = Math.min(26, nodeHeight(node) - 6)
         const nw = nodeWidth(node)
         const bx = node.position.x + nw - btnW - 14
         const by = node.position.y + (nodeHeight(node) - btnH) / 2
@@ -2177,41 +2213,30 @@ export default function LogicSimulator() {
 
     if (drawing.current) {
       const d = drawing.current
+
+      // Magnetise onto a valid target pin (cosmetic — the preview engine
+      // will still enforce AABB collision).
       const magnetPin = findPinAt(p, 8)
-      let target: Vec2
+      let raw: Vec2
       if (magnetPin && isValidWireTarget(magnetPin, d.from)) {
-        target = snapWirePoint(magnetPin.pos)
+        raw = snapWirePoint(magnetPin.pos)
       } else {
-        target = snapWirePoint(p)
+        raw = snapWirePoint(p)
       }
-      const last = d.points[d.points.length - 1]
-      const clippedTarget = clipCursorToNodes(last, target, live.current.nodes)
 
-      const previousCursor = d.cursor
-      mousePos.current = clippedTarget
-
-      if (d.preferH === null && d.points.length >= 1) {
+      // Update first-segment orientation preference once, based on the
+      // dominant axis of the very first movement.
+      if (d.preferH === null) {
         const lastPt = d.points[d.points.length - 1]
-        const adx = Math.abs(clippedTarget.x - lastPt.x)
-        const ady = Math.abs(clippedTarget.y - lastPt.y)
-        const THRESH = SUB_GRID
-        if (adx >= THRESH || ady >= THRESH) {
+        const adx = Math.abs(raw.x - lastPt.x)
+        const ady = Math.abs(raw.y - lastPt.y)
+        if (adx >= SUB_GRID || ady >= SUB_GRID) {
           d.preferH = adx >= ady
         }
       }
 
-      const cursorMoved = previousCursor.x !== clippedTarget.x || previousCursor.y !== clippedTarget.y
-      if (cursorMoved && d.points.length > 1) {
-        for (let i = d.points.length - 1; i >= 1; i--) {
-          const wp = d.points[i]
-          if (wp.x === clippedTarget.x && wp.y === clippedTarget.y) {
-            d.points = d.points.slice(0, i)
-            d.preferH = null
-            break
-          }
-        }
-      }
-      d.cursor = clippedTarget
+      d.cursor = raw
+      mousePos.current = raw
       return
     }
 
@@ -2761,7 +2786,7 @@ export default function LogicSimulator() {
       adjacency[root].push(key)
     }
     const data = {
-      version: 7,
+      version: 8,
       nodes,
       wires,
       junctions,
@@ -2915,22 +2940,26 @@ export default function LogicSimulator() {
         ? { x: drag.current.startX, y: drag.current.startY, w: drag.current.endX - drag.current.startX, h: drag.current.endY - drag.current.startY }
         : null
 
+      // ---- SEGMENT-BASED CORRIDOR PREVIEW -------------------------
+      // The preview is built by first picking the raw L-shape from the
+      // last committed point to the current mouse position, then running
+      // a segment-by-segment AABB test.  If NEITHER dynamic segment hits
+      // a component, the L-shape is rendered whole → the wire is
+      // UNFROZEN.  Otherwise it truncates at the entry boundary.
       let drawingPreview: { fromPos: Vec2; pts: Vec2[] } | null = null
       if (drawing.current) {
         const d = drawing.current
-        const last = d.points[d.points.length - 1]
-
-        // Step 1: clip the direct [last → mouse] segment against all
-        // component boxes (spec: Line-Segment vs AABB raycasting).
-        const clippedCursor = clipCursorToNodes(last, mousePos.current, s.nodes)
-
-        // Step 2: build the orthogonal L-shape from the fixed polyline
-        // to the clipped cursor, then run the same collision test on the
-        // resulting dog-leg segments so the rendered preview never
-        // tunnels through a component body.
-        const tentative = orthogonalPathTo(d.points, clippedCursor, d.preferH)
-        const pts = clipPolylineToNodes(tentative, s.nodes)
-        drawingPreview = { fromPos: d.fromPos, pts }
+        const preview = buildPreviewPolyline(
+          d.points,
+          mousePos.current,
+          d.preferH,
+          s.nodes,
+          d.from.nodeId,
+        )
+        // Stitch: everything except the last committed point, then the
+        // freshly computed preview segments.
+        const fullPath = [...d.points.slice(0, -1), ...preview]
+        drawingPreview = { fromPos: d.fromPos, pts: fullPath }
       }
 
       const chipMeta: Record<string, { color: string }> = {}
