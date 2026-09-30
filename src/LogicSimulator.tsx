@@ -30,17 +30,23 @@ import {
 } from 'lucide-react'
 
 /* =====================================================================
- *  LogicSimulator — v6
+ *  LogicSimulator — v7
  *  ---------------------------------------------------------------------
  *  NEW IN THIS VERSION:
- *   [1] Sub-grid alignment (8 px) so vertically-centered outputs align
- *       with downstream input pins — straight horizontal wires.
- *   [2] Strict boundary blocking: wire drafting FREEZES at the outer
- *       edge of any component box. No auto-rerouting.
- *   [3] OUT component: bulb icon and text label no longer overlap.
- *   [4] Lead-out pin stubs (crocodile-clip terminals): 8 px visible
- *       stubs extend outward from each component edge; wires snap to
- *       the stub TIPS, not the box edge.
+ *   [1] Strict mathematical pin-grid formula:
+ *         N_max = max(N_inputs, N_outputs)
+ *         H_grid = 2·N_max + 1        (component height in grid units)
+ *         C_grid = N_max + 1          (vertical center grid index)
+ *         Y_start = N_max - k + 2     (first pin grid index for k pins)
+ *         pins at Y_start, Y_start+2, …, Y_start+2(k-1)
+ *       → All pins land on integer grid nodes; centered outputs align.
+ *   [2] Lead-out stubs are exactly 1·GRID_SIZE long, anchored on the box
+ *       wall, so the outer tip lands on the adjacent grid intersection.
+ *   [3] Wire-draft collision now uses Line-Segment vs AABB (slab method)
+ *       raycasting: preview truncates at the entry boundary of ANY
+ *       component box.  Wires can no longer pass through a component.
+ *   [4] Node width is rounded up to GRID so right-edge lead-out tips are
+ *       also grid-aligned.
  * ===================================================================== */
 
 type PinSide = 'in' | 'out'
@@ -128,20 +134,15 @@ const isPinRefEqual = (a: PinRef, b: PinRef) =>
   a.nodeId === b.nodeId && a.pinId === b.pinId && a.side === b.side
 
 /* --------------------------- Geometry --------------------------------
- *  GRID = 16 (routing grid, dot spacing)
- *  SUB_GRID = 8 (finest snapping resolution)
- *  Pin spacing is 32 (2 × GRID, 4 × SUB_GRID) so pins always land on
- *  integer grid lines. Output pins on 2-input gates sit at half-height.
- *  Because height = NODE_PAD*2 + SPACING + PIN_SPACING = multiple of
- *  2*SUB_GRID, the mid-height is also a multiple of SUB_GRID.
+ *  GRID = 16 (routing grid; pins & box edges are always on this grid)
+ *  SUB_GRID = 8 (fine snapping for wire corners)
+ *  LEADOUT = 1·GRID (lead-out stub length; outer tip = adjacent node)
  * -------------------------------------------------------------------- */
 const GRID = 16
 const SUB_GRID = 8
-const NODE_W_MIN = 88
-const NODE_PAD = 16
-const PIN_SPACING = 32
+const NODE_W_MIN = 96         // multiple of GRID
 const PIN_R = 4.5
-const LEADOUT = 10         // length of pin lead-out stub
+const LEADOUT = GRID          // stub length = exactly 1 grid unit
 const MIN_ZOOM = 0.05
 const MAX_ZOOM = 4
 const WIRE_CLEARANCE = 2
@@ -155,33 +156,41 @@ const uid = (prefix = 'n') =>
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 /** Snap to routing grid (16 px). */
 const snap = (v: number) => Math.round(v / GRID) * GRID
-/** Snap to sub-grid (8 px). Pins and wire corners both use this. */
+/** Snap to sub-grid (8 px). */
 const snapSub = (v: number) => Math.round(v / SUB_GRID) * SUB_GRID
 
 function approxLabelWidth(label: string): number {
   return Math.ceil(label.length * 5.6) + 40
 }
 
-const nodeRows = (n: CircuitNode) => Math.max(n.inputs.length, n.outputs.length, 1)
+/**
+ * N_max = max(N_inputs, N_outputs, 1)
+ * The strict pin-grid formula uses this everywhere.
+ */
+const NmaxOf = (n: CircuitNode) =>
+  Math.max(n.inputs.length, n.outputs.length, 1)
 
 /**
- * Node height: chosen so that:
- *  - The vertical distance between the first and last pin row is a
- *    multiple of PIN_SPACING (32 = 4 × SUB_GRID).
- *  - The total height is a multiple of SUB_GRID.
- * This guarantees that pin Y coordinates always sit on SUB_GRID lines.
+ * Component height in pixels.
+ *   H_grid  = 2·N_max + 1
+ *   height  = H_grid · GRID_SIZE
+ * Total height is always a multiple of GRID, guaranteeing that every
+ * pin row (which sits at grid indices) lands on an integer grid node.
  *
- *   height = NODE_PAD*2 + PIN_SPACING*(rows-1) + PIN_SPACING
- * For rows=2: 16*2 + 32 + 32 = 96  (multiple of 8 ✓)
- * For rows=1: 16*2 +  0 + 32 = 64  (multiple of 8 ✓)
+ * Examples:
+ *   2 inputs / 1 output  → H_grid = 5 → 80 px
+ *   1 input  / 1 output  → H_grid = 3 → 48 px
  */
 const nodeHeight = (n: CircuitNode) => {
   if (n.kind === 'CHIP' && n.unfolded && n.unfoldedSize) return n.unfoldedSize.h
-  const rows = nodeRows(n)
-  const raw = NODE_PAD * 2 + PIN_SPACING * (rows - 1) + PIN_SPACING
-  return Math.ceil(raw / SUB_GRID) * SUB_GRID
+  const N = NmaxOf(n)
+  return (2 * N + 1) * GRID
 }
 
+/**
+ * Component width. Rounded up to GRID so the right-edge lead-out tip
+ * (box.x + box.w + LEADOUT) also lands on a grid intersection.
+ */
 const nodeWidth = (n: CircuitNode) => {
   if (n.kind === 'CHIP' && n.unfolded && n.unfoldedSize) return n.unfoldedSize.w
   const fromLabel = approxLabelWidth(n.label)
@@ -198,18 +207,22 @@ const nodeWidth = (n: CircuitNode) => {
     n.kind === 'INPUT' || n.kind === 'BUTTON' || n.kind === 'CLOCK' ? 66 : 0
   const outReserve = n.kind === 'OUTPUT' ? 40 : 0
   const raw = Math.max(NODE_W_MIN, fromLabel + btnReserve + outReserve + pinExtra)
-  return Math.ceil(raw / SUB_GRID) * SUB_GRID
+  return Math.ceil(raw / GRID) * GRID
 }
 const nodeBox = (n: CircuitNode) => ({
   x: n.position.x, y: n.position.y, w: nodeWidth(n), h: nodeHeight(n),
 })
 
 /**
- * Compute the pin position for a node's pin (either the "outer anchor"
- * — where the wire connects — or the "inner anchor" — where the lead-out
- * stub meets the box edge).
+ * Compute the pin's outer anchor position — the tip of the lead-out
+ * stub, which is where wires attach.
  *
- * `leadOut` distance pushes the outer anchor further away from the box.
+ * Grid formula (independent of which edge we're on):
+ *   gridIndex = N_max − k + 2 + 2·index
+ *   along-edge offset = gridIndex · GRID
+ *
+ * Horizontal edges (left/right): offset is along Y.
+ * Vertical edges (top/bottom, i.e. rotated): offset is along X.
  */
 function pinPos(n: CircuitNode, side: PinSide, index: number, count: number): Vec2 {
   if (n.kind === 'CHIP' && n.unfolded && n.unfoldedPinPos) {
@@ -225,39 +238,18 @@ function pinPos(n: CircuitNode, side: PinSide, index: number, count: number): Ve
   else if (rot === 270) edge = side === 'in' ? 'bottom' : 'top'
   else edge = side === 'in' ? 'left' : 'right'
 
+  const N = NmaxOf(n)
+  const gridIndex = N - count + 2 + 2 * index
+
   if (edge === 'left' || edge === 'right') {
-    const innerX = edge === 'left' ? b.x : b.x + b.w
     const outerX = edge === 'left' ? b.x - LEADOUT : b.x + b.w + LEADOUT
-    // Pin rows evenly distributed. For a centered single pin, use h/2.
-    let y: number
-    if (count <= 1) {
-      y = b.y + b.h / 2
-    } else {
-      const top = b.y + NODE_PAD + PIN_SPACING / 2
-      const bottom = b.y + b.h - NODE_PAD - PIN_SPACING / 2
-      y = top + ((bottom - top) * index) / (count - 1)
-    }
-    const ySnapped = snapSub(y)
-    return { x: outerX, y: ySnapped }
-    // Inner anchor variant handled separately by pinInnerPos.
-    void innerX
+    return { x: outerX, y: b.y + gridIndex * GRID }
   }
-  const innerY = edge === 'top' ? b.y : b.y + b.h
   const outerY = edge === 'top' ? b.y - LEADOUT : b.y + b.h + LEADOUT
-  let x: number
-  if (count <= 1) {
-    x = b.x + b.w / 2
-  } else {
-    const left = b.x + NODE_PAD + PIN_SPACING / 2
-    const right = b.x + b.w - NODE_PAD - PIN_SPACING / 2
-    x = left + ((right - left) * index) / (count - 1)
-  }
-  const xSnapped = snapSub(x)
-  return { x: xSnapped, y: outerY }
-  void innerY
+  return { x: b.x + gridIndex * GRID, y: outerY }
 }
 
-/** The point on the box edge where the lead-out stub attaches. */
+/** The point on the box wall where the lead-out stub attaches. */
 function pinInnerPos(n: CircuitNode, side: PinSide, index: number, count: number): Vec2 {
   const outer = pinPos(n, side, index, count)
   const b = nodeBox(n)
@@ -1003,25 +995,126 @@ function pointInAnyNode(p: Vec2, nodes: CircuitNode[], ignoreIds?: Set<string>):
 }
 
 /**
- * Strict boundary blocking: if the target point lies inside any node box,
- * pull the point back to the closest point on the box's outer boundary.
- * No auto-rerouting — we just clamp along the segment from `last`.
+ * Slab-method Line Segment vs Axis-Aligned Bounding Box intersection.
+ * Returns the first entry point (from a toward b) with its parameter t∈[0,1],
+ * or null if no intersection.
+ */
+function segmentAABBIntersect(
+  a: Vec2, b: Vec2,
+  box: { x: number; y: number; w: number; h: number },
+): { pt: Vec2; t: number } | null {
+  const minX = box.x
+  const maxX = box.x + box.w
+  const minY = box.y
+  const maxY = box.y + box.h
+
+  // If the start point is already inside the box, it's an immediate hit.
+  if (a.x >= minX && a.x <= maxX && a.y >= minY && a.y <= maxY) {
+    return { pt: { x: a.x, y: a.y }, t: 0 }
+  }
+
+  const dx = b.x - a.x
+  const dy = b.y - a.y
+
+  let tmin = 0
+  let tmax = 1
+  const p = [-dx, dx, -dy, dy]
+  const q = [a.x - minX, maxX - a.x, a.y - minY, maxY - a.y]
+
+  for (let i = 0; i < 4; i++) {
+    if (p[i] === 0) {
+      // Parallel to this slab; if outside, no intersection.
+      if (q[i] < 0) return null
+    } else {
+      const t = q[i] / p[i]
+      if (p[i] < 0) {
+        if (t > tmin) tmin = t
+      } else {
+        if (t < tmax) tmax = t
+      }
+    }
+  }
+
+  if (tmin > tmax) return null
+  return { pt: { x: a.x + tmin * dx, y: a.y + tmin * dy }, t: tmin }
+}
+
+/**
+ * Strict boundary blocking via Line-Segment vs AABB:
+ * Cast the segment [last → target] against every component box.
+ * If it intersects, return the entry boundary point (pulled back a hair
+ * so the endpoint sits just outside the wall).
  */
 function clipCursorToNodes(
   last: Vec2, target: Vec2, nodes: CircuitNode[], ignoreIds?: Set<string>,
 ): Vec2 {
-  if (!pointInAnyNode(target, nodes, ignoreIds)) return target
-  // Binary search along the segment for the boundary crossing.
-  let lo = 0, hi = 1
-  for (let iter = 0; iter < 24; iter++) {
-    const mid = (lo + hi) / 2
-    const p = { x: last.x + (target.x - last.x) * mid, y: last.y + (target.y - last.y) * mid }
-    if (pointInAnyNode(p, nodes, ignoreIds)) hi = mid
-    else lo = mid
+  let best: { pt: Vec2; t: number } | null = null
+
+  for (const n of nodes) {
+    if (ignoreIds?.has(n.id)) continue
+    const b = nodeBox(n)
+    const expanded = {
+      x: b.x - WIRE_CLEARANCE,
+      y: b.y - WIRE_CLEARANCE,
+      w: b.w + 2 * WIRE_CLEARANCE,
+      h: b.h + 2 * WIRE_CLEARANCE,
+    }
+    const hit = segmentAABBIntersect(last, target, expanded)
+    if (hit && (!best || hit.t < best.t)) best = hit
   }
-  // Take the last outside point, then push slightly away from the box.
-  const outside = { x: last.x + (target.x - last.x) * lo, y: last.y + (target.y - last.y) * lo }
-  return snapWirePoint(outside)
+
+  if (!best) return target
+
+  // Pull back slightly along the direction of travel so the endpoint is
+  // strictly outside the collision envelope.
+  const dx = target.x - last.x
+  const dy = target.y - last.y
+  const len = Math.hypot(dx, dy) || 1
+  const back = 0.5
+  return {
+    x: best.pt.x - (dx / len) * back,
+    y: best.pt.y - (dy / len) * back,
+  }
+}
+
+/**
+ * Truncate an entire orthogonal polyline (segment by segment) at the first
+ * component-box entry point. Used to keep the L-shaped preview from
+ * clipping through boxes when the direct segment [last → cursor] does not
+ * itself intersect (but the orthogonalised dog-leg does).
+ */
+function clipPolylineToNodes(
+  points: Vec2[], nodes: CircuitNode[], ignoreIds?: Set<string>,
+): Vec2[] {
+  if (points.length < 2) return points.map((p) => ({ ...p }))
+  const out: Vec2[] = [{ ...points[0] }]
+
+  for (let i = 1; i < points.length; i++) {
+    const a = out[out.length - 1]
+    const b = points[i]
+    let best: { pt: Vec2; t: number } | null = null
+    for (const n of nodes) {
+      if (ignoreIds?.has(n.id)) continue
+      const box = nodeBox(n)
+      const expanded = {
+        x: box.x - WIRE_CLEARANCE,
+        y: box.y - WIRE_CLEARANCE,
+        w: box.w + 2 * WIRE_CLEARANCE,
+        h: box.h + 2 * WIRE_CLEARANCE,
+      }
+      const hit = segmentAABBIntersect(a, b, expanded)
+      if (hit && hit.t > 0 && hit.t <= 1 && (!best || hit.t < best.t)) best = hit
+    }
+    if (best) {
+      const dx = b.x - a.x, dy = b.y - a.y
+      const len = Math.hypot(dx, dy) || 1
+      const back = 0.5
+      out.push({ x: best.pt.x - (dx / len) * back, y: best.pt.y - (dy / len) * back })
+      return out
+    }
+    out.push({ ...b })
+  }
+  return out
 }
 
 function drawBody(
@@ -1095,16 +1188,13 @@ function drawNode(
     const value = !!signal[pinKey(n.id, n.inputs[0]?.id ?? 'in')]
     const nw = nodeWidth(n)
     const cy = n.position.y + b.h / 2
-    // [3] Fixed layout: label on the left, bulb icon on the right.
-    // Reserve the rightmost ~30px for the bulb; draw the label to the left.
     const bulbCx = n.position.x + nw - 22
-    const labelMaxWidth = nw - 22 - 44   // stop before the bulb
+    const labelMaxWidth = nw - 22 - 44
     if (value) { ctx.save(); ctx.shadowColor = theme.wireHigh + '80'; ctx.shadowBlur = 14 }
     ctx.beginPath()
     ctx.arc(bulbCx, cy - 2, 8, 0, Math.PI * 2)
     ctx.fillStyle = value ? theme.wireHigh : (dark ? '#334155' : '#cbd5e1'); ctx.fill()
     ctx.strokeStyle = value ? theme.wireHigh : theme.pinLow; ctx.lineWidth = 1.5; ctx.stroke()
-    // Bulb base (screw cap)
     ctx.beginPath()
     ctx.moveTo(bulbCx - 4.5, cy + 6.5); ctx.lineTo(bulbCx + 4.5, cy + 6.5)
     ctx.lineTo(bulbCx + 3, cy + 10); ctx.lineTo(bulbCx - 3, cy + 10)
@@ -1112,7 +1202,6 @@ function drawNode(
     ctx.fillStyle = value ? theme.wireHigh : (dark ? '#475569' : '#94a3b8')
     ctx.fill()
     if (value) ctx.restore()
-    // Label drawn on the left of the bulb area.
     ctx.fillStyle = theme.label
     ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif'
     ctx.textAlign = 'left'; ctx.textBaseline = 'middle'
@@ -1154,7 +1243,6 @@ function drawNode(
   // Standard gate
   drawBody(ctx, n, fill, edge, selected, zoom, theme)
   const cx = n.position.x + b.w / 2
-  // Place the glyph centered in the vertical space BELOW the small label.
   const labelY = n.position.y + 14
   const glyphY = n.position.y + b.h / 2 + 4
   const glyph = GATE_GLYPH[n.kind] ?? '?'
@@ -1176,7 +1264,7 @@ function drawPin(
   dark: boolean,
 ) {
   const { pos, innerPos } = pin
-  // Lead-out stub: a short line from the box edge to the outer anchor.
+  // Lead-out stub: a 1·GRID line from the box wall to the outer anchor.
   ctx.strokeStyle = connected ? (high ? theme.wireHigh : theme.wireLow)
     : (dark ? '#71717a' : '#94a3b8')
   ctx.lineWidth = connected
@@ -1187,7 +1275,6 @@ function drawPin(
   ctx.lineTo(pos.x, pos.y)
   ctx.stroke()
 
-  // Terminal circle at the stub tip — only when NOT connected.
   if (!connected) {
     ctx.beginPath()
     ctx.arc(pos.x, pos.y, PIN_R, 0, Math.PI * 2)
@@ -1197,7 +1284,6 @@ function drawPin(
     ctx.lineWidth = 1.3 / zoom
     ctx.stroke()
   } else {
-    // Connected: tiny dot marker at the tip so it's clear where it attaches.
     ctx.beginPath()
     ctx.arc(pos.x, pos.y, PIN_R * 0.55, 0, Math.PI * 2)
     ctx.fillStyle = high ? theme.pinHigh : (dark ? '#71717a' : '#94a3b8')
@@ -1405,7 +1491,6 @@ function drawScene(
 
   const connectedTerminals = computeConnectedTerminals(wires, junctions)
 
-  // 1. Draw wires first (so lead-out stubs go on top).
   const wirePolys: { w: Wire; pts: Vec2[]; high: boolean; hover: boolean; isSel: boolean }[] = []
   for (const w of wires) {
     const vw = wireView(w, nodes, junctions)
@@ -1511,7 +1596,6 @@ function drawScene(
     ctx.setLineDash([])
   }
 
-  // 2. Nodes.
   for (const n of nodes) {
     if (n.kind === 'CHIP' && n.unfolded && n.chipId && chipById[n.chipId]) {
       drawUnfoldedChip(ctx, n, chipById[n.chipId], selected.has(n.id), signal, chipMeta, zoom, theme, dark)
@@ -1520,7 +1604,6 @@ function drawScene(
     drawNode(ctx, n, selected.has(n.id), signal, chipMeta, zoom, theme, dark)
   }
 
-  // 3. Lead-out stubs and terminal dots (on top of boxes).
   for (const n of nodes) {
     if (n.kind === 'CHIP' && n.unfolded && n.chipId && chipById[n.chipId]) continue
     for (const pin of enumeratePins(n)) {
@@ -1589,7 +1672,7 @@ function renderNodesToImage(
 }
 
 /* Persistence */
-const STORAGE_KEY = 'logicmaker.v6'
+const STORAGE_KEY = 'logicmaker.v7'
 interface SavedState {
   nodes: CircuitNode[]; wires: Wire[]; junctions?: Junction[]
   chips: ChipDefinition[]; camera: Camera; dark?: boolean
@@ -1844,18 +1927,18 @@ export default function LogicSimulator() {
   const place = (p: Vec2) => {
     if (!placement) return
     pushHistory()
-    const ghostH = placement.type === 'PRIMITIVE'
-      ? nodeHeight(createPrimitiveNode(placement.kind, { x: 0, y: 0 }))
-      : 64
-    const snapped = { x: snap(p.x - NODE_W_MIN / 2), y: snap(p.y - ghostH / 2) }
     let node: CircuitNode
     if (placement.type === 'CHIP') {
       const chip = chipsById[placement.chipId]
       if (!chip) return
-      node = createChipNode(chip, snapped)
+      node = createChipNode(chip, { x: 0, y: 0 })
     } else {
-      node = createPrimitiveNode(placement.kind, snapped)
+      node = createPrimitiveNode(placement.kind, { x: 0, y: 0 })
     }
+    const w = nodeWidth(node)
+    const h = nodeHeight(node)
+    const snapped = { x: snap(p.x - w / 2), y: snap(p.y - h / 2) }
+    node = { ...node, position: snapped }
     setNodes((ns) => [...ns, node])
     setSelected(new Set([node.id]))
     setSelectedWireId(null)
@@ -1873,12 +1956,14 @@ export default function LogicSimulator() {
         const chip = chipsById[placement.chipId]
         return chip ? createChipNode(chip, { x: 0, y: 0 }) : null
       })()
-    const ghostH = sample ? nodeHeight(sample) : 64
+    if (!sample) { setPaletteCtxMenu(null); return }
+    const sampleW = nodeWidth(sample)
+    const ghostH = nodeHeight(sample)
     const spacingY = snap(ghostH + 24)
     const newNodes: CircuitNode[] = []
     for (let i = 0; i < count; i++) {
       const pos = {
-        x: snap(cursor.x - NODE_W_MIN / 2),
+        x: snap(cursor.x - sampleW / 2),
         y: snap(cursor.y - ((count - 1) * spacingY) / 2 + i * spacingY - ghostH / 2),
       }
       let node: CircuitNode
@@ -2676,7 +2761,7 @@ export default function LogicSimulator() {
       adjacency[root].push(key)
     }
     const data = {
-      version: 6,
+      version: 7,
       nodes,
       wires,
       junctions,
@@ -2834,8 +2919,17 @@ export default function LogicSimulator() {
       if (drawing.current) {
         const d = drawing.current
         const last = d.points[d.points.length - 1]
+
+        // Step 1: clip the direct [last → mouse] segment against all
+        // component boxes (spec: Line-Segment vs AABB raycasting).
         const clippedCursor = clipCursorToNodes(last, mousePos.current, s.nodes)
-        const pts = orthogonalPathTo(d.points, clippedCursor, d.preferH)
+
+        // Step 2: build the orthogonal L-shape from the fixed polyline
+        // to the clipped cursor, then run the same collision test on the
+        // resulting dog-leg segments so the rendered preview never
+        // tunnels through a component body.
+        const tentative = orthogonalPathTo(d.points, clippedCursor, d.preferH)
+        const pts = clipPolylineToNodes(tentative, s.nodes)
         drawingPreview = { fromPos: d.fromPos, pts }
       }
 
@@ -2849,16 +2943,20 @@ export default function LogicSimulator() {
         if (s.placement.type === 'CHIP') {
           const chip = s.chips.find((c) => c.id === s.placement!.chipId)
           if (chip) {
-            const h = nodeHeight(createChipNode(chip, { x: 0, y: 0 }))
+            const temp = createChipNode(chip, { x: 0, y: 0 })
+            const w = nodeWidth(temp)
+            const h = nodeHeight(temp)
             placingNode = createChipNode(chip, {
-              x: snap(mousePos.current.x - NODE_W_MIN / 2),
+              x: snap(mousePos.current.x - w / 2),
               y: snap(mousePos.current.y - h / 2),
             })
           }
         } else {
-          const h = nodeHeight(createPrimitiveNode(s.placement.kind, { x: 0, y: 0 }))
+          const temp = createPrimitiveNode(s.placement.kind, { x: 0, y: 0 })
+          const w = nodeWidth(temp)
+          const h = nodeHeight(temp)
           placingNode = createPrimitiveNode(s.placement.kind, {
-            x: snap(mousePos.current.x - NODE_W_MIN / 2),
+            x: snap(mousePos.current.x - w / 2),
             y: snap(mousePos.current.y - h / 2),
           })
         }
