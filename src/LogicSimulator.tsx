@@ -1034,21 +1034,6 @@ function segmentAABBIntersect(
   return { pt: { x: a.x + tmin * dx, y: a.y + tmin * dy }, t: tmin }
 }
 
-/** Is the point inside any node's rectangle (with clearance)? */
-function pointInAnyNode(p: Vec2, nodes: CircuitNode[], ignoreIds?: Set<string>): boolean {
-  for (const n of nodes) {
-    if (ignoreIds?.has(n.id)) continue
-    const b = nodeBox(n)
-    if (
-      p.x >= b.x - WIRE_CLEARANCE &&
-      p.x <= b.x + b.w + WIRE_CLEARANCE &&
-      p.y >= b.y - WIRE_CLEARANCE &&
-      p.y <= b.y + b.h + WIRE_CLEARANCE
-    ) return true
-  }
-  return false
-}
-
 /**
  * SEGMENT-BASED CORRIDOR TRUNCATION.
  * Takes a proposed polyline starting at `pts[0]` and walks segments one
@@ -2969,8 +2954,9 @@ export default function LogicSimulator() {
 
       let placingNode: CircuitNode | null = null
       if (s.placement) {
-        if (s.placement.type === 'CHIP') {
-          const chip = s.chips.find((c) => c.id === s.placement!.chipId)
+        const placement = s.placement
+        if (placement.type === 'CHIP') {
+          const chip = s.chips.find((c) => c.id === placement.chipId)
           if (chip) {
             const temp = createChipNode(chip, { x: 0, y: 0 })
             const w = nodeWidth(temp)
@@ -2981,10 +2967,10 @@ export default function LogicSimulator() {
             })
           }
         } else {
-          const temp = createPrimitiveNode(s.placement.kind, { x: 0, y: 0 })
+          const temp = createPrimitiveNode(placement.kind, { x: 0, y: 0 })
           const w = nodeWidth(temp)
           const h = nodeHeight(temp)
-          placingNode = createPrimitiveNode(s.placement.kind, {
+          placingNode = createPrimitiveNode(placement.kind, {
             x: snap(mousePos.current.x - w / 2),
             y: snap(mousePos.current.y - h / 2),
           })
@@ -3384,7 +3370,7 @@ export default function LogicSimulator() {
             <h2 className="mb-1 text-sm font-semibold">Change Component</h2>
             <p className="mb-3 text-[11px] opacity-60">Wires are re-mapped by pin index. Label resets to the new default.</p>
 
-            <div className="max-h-[280px] overflow-y-auto pr-1">
+            <div className="max-h-70 overflow-y-auto pr-1">
               <div className="mb-1 px-1 text-[10px] font-semibold uppercase tracking-wider opacity-50">I/O</div>
               <div className="mb-3 flex flex-col gap-0.5">
                 {IO_BLOCKS.map((k) => (
