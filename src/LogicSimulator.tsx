@@ -27,6 +27,7 @@ import {
   Maximize2,
   Minimize2,
   Power,
+  FlipHorizontal,
 } from 'lucide-react'
 
 type PinSide = 'in' | 'out'
@@ -59,6 +60,7 @@ interface Wire {
   from: PinRef
   to: PinRef
   points?: Vec2[]
+  color?: string
 }
 interface Junction {
   id: string
@@ -119,14 +121,22 @@ const LEADOUT = GRID
 const MIN_ZOOM = 0.05
 const MAX_ZOOM = 4
 const WIRE_CLEARANCE = 2
-const PIN_SNAP_RADIUS = 22
 const WIRE_SNAP_RADIUS = 14
 const WIRE_MERGE_TOL = 6
+const PIN_HIT_RADIUS = 7   // screen-pixel hit radius — no magnetism
+const WIRE_SEG_HIT = 6     // screen-pixel hit radius for segment dragging
 
-/* Bridge geometry — world-space (units of GRID). */
-const BRIDGE_W = GRID * 0.5    // horizontal bulge width  = 8
-const BRIDGE_H = GRID * 0.25   // vertical span           = 4
-const BRIDGE_GAP = BRIDGE_H / 2 // half the interruption span
+/* Bridge geometry — world-space.  Taller arc, opaque apex. */
+const BRIDGE_W = GRID * 0.7
+const BRIDGE_H = GRID * 0.7
+const BRIDGE_GAP = BRIDGE_H / 2
+
+/* Lucide Lightbulb SVG path data (viewBox 0 0 24 24). */
+const LIGHTBULB_PATHS = [
+  'M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5',
+  'M9 18h6',
+  'M10 22h4',
+]
 
 let idCounter = 0
 const uid = (prefix = 'n') =>
@@ -146,8 +156,28 @@ const baseHeight = (n: CircuitNode) => {
   return 2 * NmaxOf(n) * GRID
 }
 
+/**
+ * Dynamic width — no hardcoded static widths.  I/O nodes size to their
+ * label content with explicit padding so the toggle / lamp never touches
+ * the outer borders.
+ */
 const nodeWidth = (n: CircuitNode) => {
   if (n.kind === 'CHIP' && n.unfolded && n.unfoldedSize) return n.unfoldedSize.w
+
+  if (n.kind === 'INPUT' || n.kind === 'BUTTON' || n.kind === 'CLOCK') {
+    const labelW = textWidth(n.label, 7.2)
+    const btnW = 48
+    const padL = 12, padR = 10, gap = 8
+    const total = padL + labelW + gap + btnW + padR
+    return Math.max(96, Math.ceil(total / GRID) * GRID)
+  }
+  if (n.kind === 'OUTPUT') {
+    const labelW = textWidth(n.label, 7.2)
+    const bulbW = 34
+    const padL = 12, padR = 10, gap = 6
+    const total = padL + labelW + gap + bulbW + padR
+    return Math.max(92, Math.ceil(total / GRID) * GRID)
+  }
 
   const titleW = textWidth(n.label, 6)
 
@@ -158,11 +188,7 @@ const nodeWidth = (n: CircuitNode) => {
     labelW = maxIn + maxOut
   }
 
-  const btnReserve =
-    n.kind === 'INPUT' || n.kind === 'BUTTON' || n.kind === 'CLOCK' ? 52 : 0
-  const outReserve = n.kind === 'OUTPUT' ? 34 : 0
-
-  const W_raw = titleW + labelW + 60 + btnReserve + outReserve
+  const W_raw = titleW + labelW + 60
   const W_clamped = Math.max(W_raw, NODE_W_MIN)
   return Math.ceil(W_clamped / GRID) * GRID
 }
@@ -265,6 +291,13 @@ const distToSegment = (p: Vec2, a: Vec2, b: Vec2) => {
   return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy))
 }
 
+/* AABB overlap between two axis-aligned boxes. */
+const boxesOverlap = (
+  a: { x: number; y: number; w: number; h: number },
+  b: { x: number; y: number; w: number; h: number },
+) =>
+  a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
+
 /* Factory */
 const PRIMITIVE_SPEC: Record<PrimitiveType, { label: string; inputs: string[]; outputs: string[] }> = {
   AND: { label: 'AND', inputs: ['A', 'B'], outputs: ['OUT'] },
@@ -299,6 +332,11 @@ const GATE_GLYPH: Record<string, string> = {
 }
 const STANDARD_GATES: PrimitiveType[] = ['AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR', 'XNOR']
 const IO_BLOCKS: PrimitiveType[] = ['INPUT', 'OUTPUT', 'CLOCK', 'BUTTON']
+
+const WIRE_PRESET_COLORS = [
+  '#2563eb', '#059669', '#d97706', '#dc2626', '#7c3aed',
+  '#0891b2', '#be185d', '#0f172a', '#f59e0b', '#10b981',
+]
 
 function hexToRgb(hex: string) {
   const h = hex.replace('#', '')
@@ -372,8 +410,8 @@ function refreshChipInstance(node: CircuitNode, chip: ChipDefinition): CircuitNo
   }
 }
 
-const createWire = (from: PinRef, to: PinRef, points?: Vec2[]): Wire =>
-  ({ id: uid('w'), from, to, ...(points && points.length >= 2 ? { points } : {}) })
+const createWire = (from: PinRef, to: PinRef, points?: Vec2[], color?: string): Wire =>
+  ({ id: uid('w'), from, to, ...(points && points.length >= 2 ? { points } : {}), ...(color ? { color } : {}) })
 
 /* Built-ins */
 const outRef = (id: string, pin: string): PinRef => ({ nodeId: id, pinId: pin, side: 'out' })
@@ -523,11 +561,6 @@ function anchorOf(
   return pinAnchor(n, { side, pinId })
 }
 
-/**
- * Safely resolve a pin anchor.  Guards against undefined nodes or missing
- * pin arrays (which produced the original "can't access property outputs
- * of undefined" crash during 90° rotation recomputation).
- */
 function pinAnchor(
   n: CircuitNode | undefined | null,
   w: { side: PinSide; pinId: string },
@@ -1063,8 +1096,99 @@ function buildPreviewPolyline(
   return truncatePolylineOnCollision(raw, nodes, ignoreNodeId)
 }
 
+/**
+ * Perimeter auto-routing for rotated components.
+ * Routes around the bounding box with an exact offset of 1 * GRID so wires
+ * NEVER pass through the body of a rotated component.  All generated turns
+ * are pushed into the returned waypoint array.
+ */
+function perimeterRoute(
+  sourceNode: CircuitNode,
+  sourceSide: PinSide,
+  start: Vec2,
+  target: Vec2,
+): Vec2[] {
+  const rot = sourceNode.rotation || 0
+  const b = nodeBox(sourceNode)
+
+  // Unrotated: simple orthogonal stub.
+  if (rot === 0) {
+    const stubX = sourceSide === 'in' ? -GRID : GRID
+    const stub = { x: start.x + stubX, y: start.y }
+    return orthogonalPathTo([start, stub], target, null)
+  }
+
+  // 90°: outputs on bottom, inputs on top.
+  if (rot === 90) {
+    if (sourceSide === 'out') {
+      // DOWN by 1 GRID → LEFT/RIGHT by w/2 + GRID → RIGHT/LEFT to target
+      const p1 = { x: start.x, y: start.y + GRID }
+      const midX = b.x + b.w / 2
+      const goRight = target.x >= start.x
+      const p2 = { x: goRight ? b.x + b.w + GRID : b.x - GRID, y: p1.y }
+      const p3 = { x: p2.x, y: b.y + b.h + GRID }
+      return [...orthogonalPathTo([start, p1, p2, p3], target, null)]
+    }
+    const p1 = { x: start.x, y: start.y - GRID }
+    const p2 = { x: target.x, y: p1.y }
+    return orthogonalPathTo([start, p1, p2], target, null)
+  }
+
+  // 180°: outputs on LEFT, inputs on RIGHT.
+  if (rot === 180) {
+    if (sourceSide === 'out') {
+      // LEFT by 1 GRID → UP/DOWN by h/2 + GRID → RIGHT by w + GRID → target
+      const p1 = { x: start.x - GRID, y: start.y }
+      const goUp = target.y <= start.y
+      const p2 = { x: p1.x, y: goUp ? b.y - GRID : b.y + b.h + GRID }
+      const p3 = { x: b.x + b.w + GRID, y: p2.y }
+      return orthogonalPathTo([start, p1, p2, p3], target, null)
+    }
+    const p1 = { x: start.x + GRID, y: start.y }
+    const p2 = { x: p1.x, y: target.y }
+    return orthogonalPathTo([start, p1, p2], target, null)
+  }
+
+  // 270°: outputs on TOP, inputs on bottom.
+  if (rot === 270) {
+    if (sourceSide === 'out') {
+      // UP by 1 GRID → LEFT/RIGHT by w/2 + GRID → DOWN by h + GRID → target
+      const p1 = { x: start.x, y: start.y - GRID }
+      const goRight = target.x >= start.x
+      const p2 = { x: goRight ? b.x + b.w + GRID : b.x - GRID, y: p1.y }
+      const p3 = { x: p2.x, y: b.y - GRID }
+      return orthogonalPathTo([start, p1, p2, p3], target, null)
+    }
+    const p1 = { x: start.x, y: start.y + GRID }
+    const p2 = { x: target.x, y: p1.y }
+    return orthogonalPathTo([start, p1, p2], target, null)
+  }
+
+  return orthogonalPathTo([start], target, null)
+}
+
+function drawLightbulb(
+  ctx: CanvasRenderingContext2D, cx: number, cy: number,
+  size: number, stroke: string, fill: string | null, lineWidth: number,
+) {
+  const s = size / 24
+  ctx.save()
+  ctx.translate(cx - size / 2, cy - size / 2)
+  ctx.scale(s, s)
+  ctx.lineWidth = lineWidth / s
+  ctx.strokeStyle = stroke
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+  for (const d of LIGHTBULB_PATHS) {
+    const p = new Path2D(d)
+    if (fill) { ctx.fillStyle = fill; ctx.fill(p) }
+    ctx.stroke(p)
+  }
+  ctx.restore()
+}
+
 function drawNode(
-  ctx: CanvasRenderingContext2D, n: CircuitNode, selected: boolean,
+  ctx: CanvasRenderingContext2D, n: CircuitNode, _selected: boolean,
   signal: SignalMap, chipMeta: Record<string, { color: string }>,
   zoom: number, theme: Theme, dark: boolean, alpha = 1,
 ) {
@@ -1081,10 +1205,10 @@ function drawNode(
     ctx.translate(b.x + b.w / 2, b.y + b.h / 2)
     ctx.rotate((rot * Math.PI) / 180)
     ctx.translate(-baseW / 2, -baseH / 2)
-    drawNodeContent(ctx, n, { x: 0, y: 0, w: baseW, h: baseH }, selected, signal, chipMeta, zoom, theme, dark)
+    drawNodeContent(ctx, n, { x: 0, y: 0, w: baseW, h: baseH }, signal, chipMeta, zoom, theme, dark)
     ctx.restore()
   } else {
-    drawNodeContent(ctx, n, b, selected, signal, chipMeta, zoom, theme, dark)
+    drawNodeContent(ctx, n, b, signal, chipMeta, zoom, theme, dark)
   }
 
   ctx.restore()
@@ -1093,7 +1217,7 @@ function drawNode(
 function drawNodeContent(
   ctx: CanvasRenderingContext2D, n: CircuitNode,
   frame: { x: number; y: number; w: number; h: number },
-  selected: boolean, signal: SignalMap,
+  signal: SignalMap,
   chipMeta: Record<string, { color: string }>,
   zoom: number, theme: Theme, dark: boolean,
 ) {
@@ -1102,13 +1226,6 @@ function drawNodeContent(
   const edge = GATE_EDGE[n.kind] ?? null
 
   if (n.kind === 'INPUT' || n.kind === 'CLOCK' || n.kind === 'BUTTON') {
-    if (selected) {
-      ctx.save()
-      ctx.strokeStyle = theme.sel
-      ctx.lineWidth = 2.8 / zoom
-      roundRect(ctx, b.x - 3.5, b.y - 3.5, b.w + 7, b.h + 7, 6)
-      ctx.stroke(); ctx.restore()
-    }
     ctx.fillStyle = fill
     roundRect(ctx, b.x, b.y, b.w, b.h, 4); ctx.fill()
     ctx.strokeStyle = edge ?? theme.edge; ctx.lineWidth = 1.6
@@ -1117,15 +1234,17 @@ function drawNodeContent(
     const value = (n.kind === 'CLOCK')
       ? (n.enabled === false ? false : !!signal[pinKey(n.id, 'out')])
       : !!n.value
-    const pad = 3
-    const btnW = Math.min(48, b.w * 0.5)
-    const btnH = Math.max(12, Math.min(26, b.h - 6))
-    const bx = b.x + b.w - btnW - pad
+    // Explicit inner padding — switch never touches the border.
+    const padR = 6
+    const btnW = 48
+    const btnH = Math.max(14, Math.min(24, b.h - 12))
+    const bx = b.x + b.w - btnW - padR
     const by = b.y + (b.h - btnH) / 2
     const disabled = n.kind === 'CLOCK' && n.enabled === false
     ctx.fillStyle = value ? theme.wireHigh : (dark ? '#3f3f46' : '#e2e8f0')
     roundRect(ctx, bx, by, btnW, btnH, 4); ctx.fill()
-    ctx.strokeStyle = value ? theme.wireHigh : (dark ? '#a1a1aa' : theme.pinLow); ctx.lineWidth = 1.2; ctx.stroke()
+    ctx.strokeStyle = value ? theme.wireHigh : (dark ? '#a1a1aa' : theme.pinLow)
+    ctx.lineWidth = 1.2; ctx.stroke()
     ctx.fillStyle = value ? '#fff' : theme.label
     ctx.font = '700 10px ui-sans-serif, system-ui, sans-serif'
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
@@ -1137,23 +1256,17 @@ function drawNodeContent(
     ctx.fillStyle = theme.label
     ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif'
     ctx.textAlign = 'left'
+    ctx.textBaseline = 'middle'
     ctx.save()
     ctx.beginPath()
-    ctx.rect(b.x + 4, b.y, bx - b.x - 6, b.h)
+    ctx.rect(b.x + 4, b.y, bx - b.x - 8, b.h)
     ctx.clip()
-    ctx.fillText(n.label, b.x + 8, b.y + b.h / 2)
+    ctx.fillText(n.label, b.x + 10, b.y + b.h / 2)
     ctx.restore()
     return
   }
 
   if (n.kind === 'OUTPUT') {
-    if (selected) {
-      ctx.save()
-      ctx.strokeStyle = theme.sel
-      ctx.lineWidth = 2.8 / zoom
-      roundRect(ctx, b.x - 3.5, b.y - 3.5, b.w + 7, b.h + 7, 6)
-      ctx.stroke(); ctx.restore()
-    }
     ctx.fillStyle = fill
     roundRect(ctx, b.x, b.y, b.w, b.h, 4); ctx.fill()
     ctx.strokeStyle = edge ?? theme.edge; ctx.lineWidth = 1.6
@@ -1161,40 +1274,32 @@ function drawNodeContent(
 
     const value = !!signal[pinKey(n.id, n.inputs[0]?.id ?? 'in')]
     const cy = b.y + b.h / 2
-    const bulbCx = b.x + b.w - 18
-    // FIX [4]: high-contrast OFF-state indicator in dark theme.
-    const offStroke = dark ? '#94a3b8' : '#64748b'
-    const offFill = dark ? '#1e293b' : '#cbd5e1'
-    const filamentColor = dark ? '#cbd5e1' : '#475569'
+    // Lamp position, using explicit padding on the right.
+    const padR = 8
+    const bulbSize = 18
+    const bulbCx = b.x + b.w - padR - bulbSize / 2
+    const bulbCy = cy
 
-    if (value) { ctx.save(); ctx.shadowColor = theme.wireHigh + '80'; ctx.shadowBlur = 14 }
-    ctx.beginPath()
-    ctx.arc(bulbCx, cy - 2, 8, 0, Math.PI * 2)
-    ctx.fillStyle = value ? theme.wireHigh : offFill; ctx.fill()
-    ctx.strokeStyle = value ? theme.wireHigh : offStroke
-    ctx.lineWidth = value ? 1.5 : 1.8
-    ctx.stroke()
-    if (!value) {
-      // Visible inner filament ring.
-      ctx.beginPath()
-      ctx.arc(bulbCx, cy - 2, 3.6, 0, Math.PI * 2)
-      ctx.strokeStyle = filamentColor
-      ctx.lineWidth = 1.1
-      ctx.stroke()
+    // Solid dark stroke in light theme, solid light stroke in dark theme.
+    const offStroke = dark ? '#e4e4e7' : '#1e293b'
+    const onStroke = dark ? theme.wireHigh : theme.wireHigh
+    const stroke = value ? onStroke : offStroke
+    const bulbFill = value ? (dark ? '#0ea5e9' : '#dbeafe') : null
+
+    if (value) {
+      ctx.save()
+      ctx.shadowColor = theme.wireHigh
+      ctx.shadowBlur = 12
     }
-    ctx.beginPath()
-    ctx.moveTo(bulbCx - 4.5, cy + 6.5); ctx.lineTo(bulbCx + 4.5, cy + 6.5)
-    ctx.lineTo(bulbCx + 3, cy + 10); ctx.lineTo(bulbCx - 3, cy + 10)
-    ctx.closePath()
-    ctx.fillStyle = value ? theme.wireHigh : (dark ? '#475569' : '#94a3b8')
-    ctx.fill()
+    drawLightbulb(ctx, bulbCx, bulbCy, bulbSize, stroke, bulbFill, value ? 2.0 : 2.2)
     if (value) ctx.restore()
+
     ctx.fillStyle = theme.label
     ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif'
     ctx.textAlign = 'left'; ctx.textBaseline = 'middle'
     ctx.save()
     ctx.beginPath()
-    ctx.rect(b.x + 6, b.y, b.w - 32, b.h)
+    ctx.rect(b.x + 6, b.y, b.w - bulbSize - 22, b.h)
     ctx.clip()
     ctx.fillText(n.label, b.x + 10, cy)
     ctx.restore()
@@ -1205,13 +1310,6 @@ function drawNodeContent(
     const meta = n.chipId ? chipMeta[n.chipId] : undefined
     const col = meta?.color ?? '#6366f1'
     const fillC = solidFill(col, dark, theme.body)
-    if (selected) {
-      ctx.save()
-      ctx.strokeStyle = theme.sel
-      ctx.lineWidth = 2.8 / zoom
-      roundRect(ctx, b.x - 3.5, b.y - 3.5, b.w + 7, b.h + 7, 6)
-      ctx.stroke(); ctx.restore()
-    }
     ctx.fillStyle = fillC
     roundRect(ctx, b.x, b.y, b.w, b.h, 4); ctx.fill()
     ctx.strokeStyle = col; ctx.lineWidth = 1.6
@@ -1238,13 +1336,6 @@ function drawNodeContent(
   }
 
   // Standard gate
-  if (selected) {
-    ctx.save()
-    ctx.strokeStyle = theme.sel
-    ctx.lineWidth = 2.8 / zoom
-    roundRect(ctx, b.x - 3.5, b.y - 3.5, b.w + 7, b.h + 7, 6)
-    ctx.stroke(); ctx.restore()
-  }
   ctx.fillStyle = fill
   roundRect(ctx, b.x, b.y, b.w, b.h, 4); ctx.fill()
   ctx.strokeStyle = edge ?? theme.edge; ctx.lineWidth = 1.6
@@ -1298,13 +1389,6 @@ function drawPin(
   }
 }
 
-function strokeWirePath(ctx: CanvasRenderingContext2D, pts: Vec2[]) {
-  if (pts.length < 2) return
-  ctx.beginPath()
-  ctx.moveTo(pts[0].x, pts[0].y)
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y)
-}
-
 function computeUnfoldedLayout(n: CircuitNode, chip: ChipDefinition) {
   const b = nodeBox(n)
   if (!chip.nodes.length) return null
@@ -1327,7 +1411,7 @@ function computeUnfoldedLayout(n: CircuitNode, chip: ChipDefinition) {
 
 function drawUnfoldedChip(
   ctx: CanvasRenderingContext2D, n: CircuitNode, chip: ChipDefinition,
-  selected: boolean, signal: SignalMap,
+  _selected: boolean, signal: SignalMap,
   chipMeta: Record<string, { color: string }>,
   zoom: number, theme: Theme, dark: boolean,
 ) {
@@ -1340,14 +1424,6 @@ function drawUnfoldedChip(
   ctx.fill()
   ctx.restore()
 
-  if (selected) {
-    ctx.save()
-    ctx.strokeStyle = theme.sel
-    ctx.lineWidth = 3 / zoom
-    roundRect(ctx, b.x - 3, b.y - 3, b.w + 6, b.h + 6, 5)
-    ctx.stroke()
-    ctx.restore()
-  }
   ctx.save()
   ctx.setLineDash([8 / zoom, 4 / zoom])
   ctx.strokeStyle = col
@@ -1394,9 +1470,12 @@ function drawUnfoldedChip(
   for (const w of chip.wires) {
     const vw = wireView(w, translated, [])
     if (!vw) continue
-    ctx.strokeStyle = theme.wireLow
+    ctx.strokeStyle = w.color ?? theme.wireLow
     ctx.lineWidth = clamp(1.8 / zoom, 1, 2.4)
-    strokeWirePath(ctx, vw.pts)
+    ctx.lineJoin = 'round'
+    ctx.beginPath()
+    ctx.moveTo(vw.pts[0].x, vw.pts[0].y)
+    for (let i = 1; i < vw.pts.length; i++) ctx.lineTo(vw.pts[i].x, vw.pts[i].y)
     ctx.stroke()
   }
 
@@ -1416,13 +1495,6 @@ interface BridgeCrossing {
   underWireId: string
 }
 
-/**
- * Compute bridge crossings.
- * FIX [2]: Only perpendicular transverse intersections are bridges.
- *   • Strict inequality excludes endpoint touches (T-junctions).
- *   • Endpoint list excludes any crossing that lands on a wire's open end.
- *   • Parallel / collinear pairs are excluded by the vertical/horizontal check.
- */
 function computeBridgeCrossings(
   wirePolys: { w: Wire; pts: Vec2[] }[],
   junctions: Junction[],
@@ -1465,7 +1537,6 @@ function computeBridgeCrossings(
       if (!horizontal) continue
       const hy = h.a.y
       const hx0 = Math.min(h.a.x, h.b.x), hx1 = Math.max(h.a.x, h.b.x)
-      // STRICT interior crossing — excludes endpoint touches.
       if (vx <= hx0 || vx >= hx1 || hy <= vy0 || hy >= vy1) continue
 
       const point = { x: vx, y: hy }
@@ -1494,6 +1565,44 @@ function computeConnectedTerminals(wires: Wire[], junctions: Junction[]): Set<st
   return s
 }
 
+/**
+ * Group selected nodes by physical touch (edge-to-edge) and return unified
+ * bounding boxes — so touching selections render one continuous outline.
+ */
+function computeSelectionGroups(
+  nodes: CircuitNode[], selected: Set<string>,
+): { x: number; y: number; w: number; h: number }[] {
+  const sel = nodes.filter((n) => selected.has(n.id))
+  if (!sel.length) return []
+  const boxes = sel.map((n) => nodeBox(n))
+  const parent = boxes.map((_, i) => i)
+  const find = (i: number): number => parent[i] === i ? i : (parent[i] = find(parent[i]))
+  const union = (a: number, b: number) => {
+    const ra = find(a), rb = find(b)
+    if (ra !== rb) parent[ra] = rb
+  }
+  for (let i = 0; i < boxes.length; i++) {
+    for (let j = i + 1; j < boxes.length; j++) {
+      const a = boxes[i], b = boxes[j]
+      // edge-to-edge touch (with 1px tolerance)
+      if (a.x <= b.x + b.w + 1 && a.x + a.w + 1 >= b.x
+        && a.y <= b.y + b.h + 1 && a.y + a.h + 1 >= b.y) union(i, j)
+    }
+  }
+  const groups = new Map<number, { x: number; y: number; w: number; h: number }>()
+  boxes.forEach((b, i) => {
+    const r = find(i)
+    const g = groups.get(r)
+    if (!g) groups.set(r, { ...b })
+    else {
+      const minX = Math.min(g.x, b.x), minY = Math.min(g.y, b.y)
+      const maxX = Math.max(g.x + g.w, b.x + b.w), maxY = Math.max(g.y + g.h, b.y + b.h)
+      groups.set(r, { x: minX, y: minY, w: maxX - minX, h: maxY - minY })
+    }
+  })
+  return Array.from(groups.values())
+}
+
 function drawScene(
   ctx: CanvasRenderingContext2D, sw: number, sh: number, dpr: number,
   cam: Camera, nodes: CircuitNode[], wires: Wire[], junctions: Junction[], signal: SignalMap,
@@ -1504,6 +1613,7 @@ function drawScene(
   bridgeCrossings: BridgeCrossing[],
   box: { x: number; y: number; w: number; h: number } | null,
   placingNode: CircuitNode | null,
+  hoverSegment: { wireId: string; index: number } | null,
   theme: Theme, dark: boolean,
 ) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
@@ -1519,22 +1629,24 @@ function drawScene(
 
   const connectedTerminals = computeConnectedTerminals(wires, junctions)
 
-  const wirePolys: { w: Wire; pts: Vec2[]; high: boolean; hover: boolean; isSel: boolean }[] = []
+  const wirePolys: { w: Wire; pts: Vec2[]; high: boolean; hover: boolean; isSel: boolean; color: string }[] = []
   for (const w of wires) {
     const vw = wireView(w, nodes, junctions)
     if (!vw) continue
     const high = !!signal[pinKey(w.from.nodeId, w.from.pinId)]
+    const onColor = w.color ?? theme.wireHigh
     wirePolys.push({
       w, pts: vw.pts, high,
       hover: hoverWireId === w.id,
       isSel: selectedWireId === w.id || selectedWireIds.has(w.id),
+      color: onColor,
     })
   }
-  type Seg = { wireId: string; a: Vec2; b: Vec2; high: boolean; hover: boolean; isSel: boolean }
+  type Seg = { wireId: string; a: Vec2; b: Vec2; high: boolean; hover: boolean; isSel: boolean; color: string }
   const segments: Seg[] = []
-  for (const { w, pts, high, hover, isSel } of wirePolys) {
+  for (const { w, pts, high, hover, isSel, color } of wirePolys) {
     for (let i = 0; i < pts.length - 1; i++) {
-      segments.push({ wireId: w.id, a: pts[i], b: pts[i + 1], high, hover, isSel })
+      segments.push({ wireId: w.id, a: pts[i], b: pts[i + 1], high, hover, isSel, color })
     }
   }
 
@@ -1545,7 +1657,11 @@ function drawScene(
     bridgeByWire.set(bridge.overWireId, list)
   }
 
-  const drawSegmentPieces = (seg: Seg, glow: boolean) => {
+  // Single continuous path per wire — no broken corners.
+  ctx.lineJoin = 'round'
+  ctx.lineCap = 'round'
+
+  const drawSegmentPieces = (seg: Seg) => {
     const a = seg.a, b = seg.b
     const horizontal = Math.abs(a.y - b.y) <= 0.5
     const vertical = Math.abs(a.x - b.x) <= 0.5
@@ -1557,14 +1673,27 @@ function drawScene(
           : false)
       .sort((p, q) => horizontal ? p.x - q.x : p.y - q.y)
 
-    const lineWidth = glow ? 7 / zoom
-      : seg.isSel ? clamp(3 / zoom, 1.6, 3.4)
-        : clamp(2.1 / zoom, 1.2, 2.6)
+    const isHoverSeg = hoverSegment && hoverSegment.wireId === seg.wireId
+      && (() => {
+        // match segment by index handled by caller
+        return false
+      })()
 
-    ctx.strokeStyle = glow ? theme.wireHigh + '30'
-      : seg.isSel ? theme.sel : seg.hover ? theme.wireHover : seg.high ? theme.wireHigh : theme.wireLow
+    const lineWidth = seg.isSel ? clamp(3 / zoom, 1.6, 3.4)
+      : clamp(2.1 / zoom, 1.2, 2.6)
+
+    // Solid colors — no semi-transparency on the ON state.
+    const baseColor = seg.isSel ? theme.sel
+      : seg.hover ? theme.wireHover
+        : seg.high ? seg.color
+          : theme.wireLow
+
+    ctx.strokeStyle = baseColor
     ctx.lineWidth = lineWidth
     if (seg.hover || seg.isSel) ctx.setLineDash([5 / zoom, 3 / zoom])
+    else ctx.setLineDash([])
+
+    void isHoverSeg
 
     if (!crossings.length) {
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke()
@@ -1598,12 +1727,9 @@ function drawScene(
     ctx.setLineDash([])
   }
 
-  for (const seg of segments) {
-    if (seg.high) drawSegmentPieces(seg, true)
-    drawSegmentPieces(seg, false)
-  }
+  for (const seg of segments) drawSegmentPieces(seg)
 
-  // FIX [3]: bridges now use world-space dimensions and a peak gradient.
+  // Bridges — taller arc, gradient apex 100% opaque & high-contrast.
   for (const bridge of bridgeCrossings) {
     const seg = segments.find((s) => s.wireId === bridge.overWireId
       && Math.abs(s.a.x - s.b.x) <= 0.5
@@ -1615,13 +1741,10 @@ function drawScene(
 
     const baseColor = seg.isSel ? theme.sel
       : seg.hover ? theme.wireHover
-        : seg.high ? theme.wireHigh
+        : seg.high ? seg.color
           : theme.wireLow
 
-    const peakColor = dark
-      ? shade(baseColor.startsWith('#') ? baseColor : '#38bdf8', 0.55)
-      : shade(baseColor.startsWith('#') ? baseColor : '#2563eb', -0.35)
-
+    const peakColor = dark ? '#ffffff' : '#000000'
     const grad = ctx.createLinearGradient(x, y - BRIDGE_GAP, x, y + BRIDGE_GAP)
     grad.addColorStop(0, baseColor)
     grad.addColorStop(0.5, peakColor)
@@ -1632,6 +1755,7 @@ function drawScene(
       ? clamp(3 / zoom, 1.6, 3.4)
       : clamp(2.1 / zoom, 1.2, 2.6)
     if (seg.hover || seg.isSel) ctx.setLineDash([5 / zoom, 3 / zoom])
+    else ctx.setLineDash([])
 
     ctx.beginPath()
     ctx.moveTo(x, y - BRIDGE_GAP)
@@ -1644,12 +1768,28 @@ function drawScene(
     ctx.setLineDash([])
   }
 
+  // Highlight the hovered segment (when a wire is selected).
+  if (hoverSegment) {
+    const wp = wirePolys.find((p) => p.w.id === hoverSegment.wireId)
+    if (wp && hoverSegment.index >= 0 && hoverSegment.index < wp.pts.length - 1) {
+      const a = wp.pts[hoverSegment.index]
+      const b = wp.pts[hoverSegment.index + 1]
+      ctx.save()
+      ctx.strokeStyle = theme.sel
+      ctx.lineWidth = clamp(5 / zoom, 2.5, 6)
+      ctx.globalAlpha = 0.35
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke()
+      ctx.restore()
+    }
+  }
+
+  // Nodes are drawn below selection rings (z-order handled later).
   for (const n of nodes) {
     if (n.kind === 'CHIP' && n.unfolded && n.chipId && chipById[n.chipId]) {
-      drawUnfoldedChip(ctx, n, chipById[n.chipId], selected.has(n.id), signal, chipMeta, zoom, theme, dark)
+      drawUnfoldedChip(ctx, n, chipById[n.chipId], false, signal, chipMeta, zoom, theme, dark)
       continue
     }
-    drawNode(ctx, n, selected.has(n.id), signal, chipMeta, zoom, theme, dark)
+    drawNode(ctx, n, false, signal, chipMeta, zoom, theme, dark)
   }
 
   for (const n of nodes) {
@@ -1660,19 +1800,37 @@ function drawScene(
     }
   }
 
+  // Elevated selection outlines — drawn last so they always sit on top.
+  const groups = computeSelectionGroups(nodes, selected)
+  for (const g of groups) {
+    ctx.save()
+    ctx.strokeStyle = theme.sel
+    ctx.lineWidth = 2.4 / zoom
+    roundRect(ctx, g.x - 3.5, g.y - 3.5, g.w + 7, g.h + 7, 6)
+    ctx.stroke()
+    ctx.restore()
+  }
+
   if (drawingPreview && drawingPreview.pts.length >= 2) {
     ctx.strokeStyle = theme.wireHigh
     ctx.setLineDash([6 / zoom, 4 / zoom])
     ctx.lineWidth = 2 / zoom
-    strokeWirePath(ctx, drawingPreview.pts)
+    ctx.lineJoin = 'round'
+    ctx.beginPath()
+    ctx.moveTo(drawingPreview.pts[0].x, drawingPreview.pts[0].y)
+    for (let i = 1; i < drawingPreview.pts.length; i++)
+      ctx.lineTo(drawingPreview.pts[i].x, drawingPreview.pts[i].y)
     ctx.stroke()
     ctx.setLineDash([])
   }
 
   if (placingNode) {
+    ctx.save()
+    ctx.globalAlpha = 0.62
     drawNode(ctx, placingNode, false, {}, chipMeta, zoom, theme, dark, 0.62)
     for (const pin of enumeratePins(placingNode))
       drawPin(ctx, pin, false, zoom, theme, false, dark)
+    ctx.restore()
   }
 
   if (box && (Math.abs(box.w) > 2 || Math.abs(box.h) > 2)) {
@@ -1714,13 +1872,13 @@ function renderNodesToImage(
   const cam: Camera = { zoom: 1, offsetX: -minX + padding, offsetY: -minY + padding }
   drawScene(
     ctx, w, h, scale, cam, nodes, wires, [], {}, new Set(), null, new Set(), null,
-    chipMeta, {}, null, [], null, null, theme, dark,
+    chipMeta, {}, null, [], null, null, null, theme, dark,
   )
   return { dataUrl: canvas.toDataURL('image/png'), width: w, height: h }
 }
 
 /* Persistence */
-const STORAGE_KEY = 'logicmaker.v10'
+const STORAGE_KEY = 'logicmaker.v11'
 interface SavedState {
   nodes: CircuitNode[]; wires: Wire[]; junctions?: Junction[]
   chips: ChipDefinition[]; camera: Camera; dark?: boolean
@@ -1742,8 +1900,9 @@ function saveState(s: SavedState) {
 
 /* Main */
 type DragMode =
-  | { kind: 'move'; ids: string[]; startWorld: Vec2; origin: Map<string, Vec2> }
+  | { kind: 'move'; ids: string[]; startWorld: Vec2; origin: Map<string, Vec2>; wireOrigin: Map<string, Vec2[]> }
   | { kind: 'box'; startX: number; startY: number; endX: number; endY: number }
+  | { kind: 'segment'; wireId: string; index: number; axis: 'x' | 'y'; startVal: number; startPoints: Vec2[] }
   | null
 
 export default function LogicSimulator() {
@@ -1762,6 +1921,7 @@ export default function LogicSimulator() {
   const [clockModal, setClockModal] = useState<{ id: string; period: number } | null>(null)
   const [renamePinModal, setRenamePinModal] = useState<{ nodeId: string; pinId: string; side: PinSide; name: string } | null>(null)
   const [changeBlockModal, setChangeBlockModal] = useState<{ nodeId: string } | null>(null)
+  const [wireColorModal, setWireColorModal] = useState<{ wireId: string; hex: string } | null>(null)
   const [chipName, setChipName] = useState('My Chip')
   const [chipColor, setChipColor] = useState(CHIP_COLORS[0])
   const [customHex, setCustomHex] = useState('#2563eb')
@@ -1780,6 +1940,7 @@ export default function LogicSimulator() {
   const spaceDown = useRef(false)
   const drawing = useRef<DrawSession | null>(null)
   const hoverWire = useRef<string | null>(null)
+  const hoverSegment = useRef<{ wireId: string; index: number } | null>(null)
   const signal = useRef<SignalMap>({})
   const mousePos = useRef<Vec2>({ x: 0, y: 0 })
   const bridgeCrossings = useRef<BridgeCrossing[]>([])
@@ -1802,8 +1963,8 @@ export default function LogicSimulator() {
   }, [wires, nodes, junctions])
 
   useEffect(() => {
-    modalOpen.current = !!(createModal || clockModal || renamePinModal || changeBlockModal)
-  }, [createModal, clockModal, renamePinModal, changeBlockModal])
+    modalOpen.current = !!(createModal || clockModal || renamePinModal || changeBlockModal || wireColorModal)
+  }, [createModal, clockModal, renamePinModal, changeBlockModal, wireColorModal])
 
   const simulator = useMemo(() => new Simulator(), [])
   const chipsById = useMemo(() => Object.fromEntries(chips.map((c) => [c.id, c])), [chips])
@@ -1912,9 +2073,11 @@ export default function LogicSimulator() {
     return screenToWorld(e.clientX - r.left, e.clientY - r.top)
   }
 
+  // Tight hit radius — no magnetism.  A wire connects only when the cursor
+  // sits essentially on the pin.
   const findPinAt = (p: Vec2, extraGrab = 0) => {
     let best: EnumeratedPin | null = null, bestD = Infinity
-    const grab = PIN_SNAP_RADIUS / live.current.camera.zoom + extraGrab
+    const grab = (PIN_HIT_RADIUS + extraGrab) / live.current.camera.zoom
     for (const n of live.current.nodes)
       for (const pin of enumeratePins(n)) {
         const d = Math.hypot(p.x - pin.pos.x, p.y - pin.pos.y)
@@ -1945,6 +2108,22 @@ export default function LogicSimulator() {
       for (let i = 0; i < vw.pts.length - 1; i++) {
         const d = distToSegment(p, vw.pts[i], vw.pts[i + 1])
         if (d < bestD) { bestD = d; best = w.id }
+      }
+    }
+    return best
+  }
+  const findHoveredSegment = (p: Vec2): { wireId: string; index: number } | null => {
+    const zoom = live.current.camera.zoom
+    const inSel = (id: string) => id === live.current.selectedWireId || live.current.selectedWireIds.has(id)
+    let best: { wireId: string; index: number } | null = null
+    let bestD = WIRE_SEG_HIT / zoom
+    for (const w of live.current.wires) {
+      if (!inSel(w.id)) continue
+      const vw = wireView(w, live.current.nodes, live.current.junctions)
+      if (!vw) continue
+      for (let i = 0; i < vw.pts.length - 1; i++) {
+        const d = distToSegment(p, vw.pts[i], vw.pts[i + 1])
+        if (d < bestD) { bestD = d; best = { wireId: w.id, index: i } }
       }
     }
     return best
@@ -2050,12 +2229,18 @@ export default function LogicSimulator() {
 
   const cancelDrawing = () => { drawing.current = null }
 
+  /**
+   * Waypoint normalization: index [0] MUST be the Output (source) pin and
+   * index [length-1] MUST be the Input (target) pin.  If the wire was drawn
+   * backwards, we reverse the array.  User-placed waypoints are preserved.
+   */
   const finishDrawing = (nodeId: string, pinId: string, side: PinSide, endPoint?: Vec2) => {
     const d = drawing.current
     if (!d) return
     let a = d.from
     let b: PinRef = { nodeId, pinId, side }
-    if (a.side === 'in' && b.side === 'out') { const t = a; a = b; b = t }
+    let swapped = false
+    if (a.side === 'in' && b.side === 'out') { const t = a; a = b; b = t; swapped = true }
     const toIsJunction = !!live.current.junctions.find((j) => j.id === b.nodeId)
     const fromIsJunction = !!live.current.junctions.find((j) => j.id === a.nodeId)
     if (!toIsJunction && !fromIsJunction) {
@@ -2068,10 +2253,19 @@ export default function LogicSimulator() {
     const targetPosRaw = endPoint ?? anchorOf(b.nodeId, b.pinId, b.side, live.current.nodes, live.current.junctions)
     if (!targetPosRaw) { cancelDrawing(); return }
     const targetPos = snapWirePoint(targetPosRaw)
-    let points = addOrthogonalAnchor(d.points, targetPos, d.preferH)
+
+    // Perimeter auto-routing for rotated source nodes.
+    const sourceNode = live.current.nodes.find((n) => n.id === a.nodeId)
+    let points: Vec2[]
+    if (sourceNode && (sourceNode.rotation || 0) !== 0) {
+      points = perimeterRoute(sourceNode, a.side, d.fromPos, targetPos)
+    } else {
+      points = addOrthogonalAnchor(d.points, targetPos, d.preferH)
+    }
+    points = ensureOrthogonalPolyline(points)
     points[0] = { ...d.fromPos }
     points[points.length - 1] = { ...targetPos }
-    points = collapsePolyline(points)
+    if (swapped) points = [...points].reverse()
 
     pushHistory()
     setWires((ws) => [...ws, createWire(a, b, points)])
@@ -2112,7 +2306,7 @@ export default function LogicSimulator() {
 
     if (drawing.current) {
       const d = drawing.current
-      const pinHit = findPinAt(p, 8)
+      const pinHit = findPinAt(p, 6)
       if (pinHit && isValidWireTarget(pinHit, d.from)) {
         finishDrawing(pinHit.nodeId, pinHit.pinId, pinHit.side, pinHit.pos)
         return
@@ -2132,6 +2326,23 @@ export default function LogicSimulator() {
       return
     }
 
+    // Segment dragging on a selected wire (orthogonal-only editing).
+    const seg = findHoveredSegment(p)
+    if (seg) {
+      const w = live.current.wires.find((x) => x.id === seg.wireId)
+      const vw = w ? wireView(w, live.current.nodes, live.current.junctions) : null
+      if (vw && seg.index < vw.pts.length - 1) {
+        const a = vw.pts[seg.index], b = vw.pts[seg.index + 1]
+        const axis: 'x' | 'y' = Math.abs(a.x - b.x) <= 0.5 ? 'x' : 'y'
+        const startPoints = vw.pts.map((q) => ({ ...q }))
+        drag.current = {
+          kind: 'segment', wireId: seg.wireId, index: seg.index,
+          axis, startVal: axis === 'x' ? p.x : p.y, startPoints,
+        }
+        return
+      }
+    }
+
     const node = findNodeAt(p)
 
     if (node && node.kind === 'CHIP' && node.unfolded && findCollapseButton(p, node)) {
@@ -2143,10 +2354,10 @@ export default function LogicSimulator() {
     if (node) {
       if (node.kind === 'INPUT' || node.kind === 'BUTTON' || node.kind === 'CLOCK') {
         const bb = nodeBox(node)
-        const pad = 3
-        const btnW = Math.min(48, bb.w * 0.5)
-        const btnH = Math.max(12, Math.min(26, bb.h - 6))
-        const bx = bb.x + bb.w - btnW - pad
+        const padR = 6
+        const btnW = 48
+        const btnH = Math.max(14, Math.min(24, bb.h - 12))
+        const bx = bb.x + bb.w - btnW - padR
         const by = bb.y + (bb.h - btnH) / 2
         if (p.x >= bx && p.x <= bx + btnW && p.y >= by && p.y <= by + btnH) {
           if (node.kind === 'BUTTON') {
@@ -2181,7 +2392,12 @@ export default function LogicSimulator() {
       setSelectedWireIds(new Set())
       const origin = new Map<string, Vec2>()
       for (const n of live.current.nodes) if (next.has(n.id)) origin.set(n.id, { ...n.position })
-      drag.current = { kind: 'move', ids: Array.from(next), startWorld: p, origin }
+      // Capture wire waypoints for synchronous dragging.
+      const wireOrigin = new Map<string, Vec2[]>()
+      for (const w of live.current.wires) {
+        if (w.points) wireOrigin.set(w.id, w.points.map((q) => ({ ...q })))
+      }
+      drag.current = { kind: 'move', ids: Array.from(next), startWorld: p, origin, wireOrigin }
       return
     }
 
@@ -2226,7 +2442,7 @@ export default function LogicSimulator() {
 
     if (drawing.current) {
       const d = drawing.current
-      const magnetPin = findPinAt(p, 8)
+      const magnetPin = findPinAt(p, 4)
       let raw: Vec2
       if (magnetPin && isValidWireTarget(magnetPin, d.from)) {
         raw = snapWirePoint(magnetPin.pos)
@@ -2249,18 +2465,92 @@ export default function LogicSimulator() {
     }
 
     if (drag.current?.kind === 'box') { drag.current.endX = p.x; drag.current.endY = p.y }
+    else if (drag.current?.kind === 'segment') {
+      const sd = drag.current
+      const curVal = sd.axis === 'x' ? p.x : p.y
+      const rawDelta = curVal - sd.startVal
+      const dSnap = Math.round(rawDelta / GRID) * GRID
+      const w = live.current.wires.find((x) => x.id === sd.wireId)
+      if (w) {
+        const idx = sd.index
+        const newPts = sd.startPoints.map((q) => ({ ...q }))
+        if (sd.axis === 'x') {
+          newPts[idx].x += dSnap
+          newPts[idx + 1].x += dSnap
+        } else {
+          newPts[idx].y += dSnap
+          newPts[idx + 1].y += dSnap
+        }
+        const nextWires = live.current.wires.map((x) => x.id === sd.wireId ? { ...x, points: newPts } : x)
+        live.current.wires = nextWires
+        setWires(nextWires)
+      }
+    }
     else if (drag.current?.kind === 'move') {
       const d = drag.current
       const dx = snap(p.x - d.startWorld.x), dy = snap(p.y - d.startWorld.y)
+
+      // AABB collision check — block the whole drag if ANY selected node
+      // would overlap a non-selected node.
+      const proposed = new Map<string, Vec2>()
+      for (const id of d.ids) {
+        const orig = d.origin.get(id)!
+        proposed.set(id, { x: orig.x + dx, y: orig.y + dy })
+      }
       const idSet = new Set(d.ids)
+      let blocked = false
+      for (const n of live.current.nodes) {
+        if (!idSet.has(n.id)) continue
+        const pos = proposed.get(n.id)!
+        const moved: CircuitNode = { ...n, position: pos }
+        const ba = nodeBox(moved)
+        for (const other of live.current.nodes) {
+          if (idSet.has(other.id)) continue
+          const bb = nodeBox(other)
+          if (boxesOverlap(ba, bb)) { blocked = true; break }
+        }
+        if (blocked) break
+      }
+      if (blocked) return
+
       const nextNodes = live.current.nodes.map((n) => idSet.has(n.id)
-        ? { ...n, position: { x: d.origin.get(n.id)!.x + dx, y: d.origin.get(n.id)!.y + dy } }
+        ? { ...n, position: proposed.get(n.id)! }
         : n)
       live.current.nodes = nextNodes
       setNodes(nextNodes)
+
+      // Synchronous wire waypoint translation — same dX, dY.
+      if (dx !== 0 || dy !== 0) {
+        let any = false
+        const nextWires = live.current.wires.map((w) => {
+          const orig = d.wireOrigin.get(w.id)
+          if (!orig) return w
+          any = true
+          return { ...w, points: orig.map((q) => ({ x: q.x + dx, y: q.y + dy })) }
+        })
+        if (any) {
+          live.current.wires = nextWires
+          setWires(nextWires)
+        }
+      }
     } else {
       hoverWire.current = findHoveredWire(p)
+      const seg = findHoveredSegment(p)
+      hoverSegment.current = seg
+      if (canvasRef.current) {
+        canvasRef.current.style.cursor = seg ? (segAxis(p, seg) === 'x' ? 'ew-resize' : 'ns-resize') : 'default'
+      }
     }
+  }
+
+  const segAxis = (p: Vec2, seg: { wireId: string; index: number }): 'x' | 'y' => {
+    const w = live.current.wires.find((x) => x.id === seg.wireId)
+    if (!w) return 'x'
+    const vw = wireView(w, live.current.nodes, live.current.junctions)
+    if (!vw || seg.index >= vw.pts.length - 1) return 'x'
+    const a = vw.pts[seg.index], b = vw.pts[seg.index + 1]
+    void p
+    return Math.abs(a.x - b.x) <= 0.5 ? 'x' : 'y'
   }
 
   const onPointerUp = (e: React.PointerEvent) => {
@@ -2278,7 +2568,7 @@ export default function LogicSimulator() {
       const r = canvasRect()
       const p = screenToWorld(e.clientX - r.left, e.clientY - r.top)
       const d = drawing.current
-      const pinHit = findPinAt(p, 16)
+      const pinHit = findPinAt(p, 8)
       if (pinHit && isValidWireTarget(pinHit, d.from)) {
         finishDrawing(pinHit.nodeId, pinHit.pinId, pinHit.side, pinHit.pos)
       }
@@ -2361,14 +2651,14 @@ export default function LogicSimulator() {
     if (!clip?.nodes.length) return
     pushHistory()
     const idMap = new Map<string, string>()
-    const offset = 20
+    const offset = GRID
     const newNodes = clip.nodes.map((n) => {
       const newId = uid(n.kind.toLowerCase())
       idMap.set(n.id, newId)
       return {
         ...n,
         id: newId,
-        position: { x: n.position.x + offset, y: n.position.y + offset },
+        position: { x: snap(n.position.x + offset), y: snap(n.position.y + offset) },
         inputs: n.inputs.map((p) => ({ ...p })),
         outputs: n.outputs.map((p) => ({ ...p })),
         unfoldedPinPos: n.unfoldedPinPos
@@ -2381,12 +2671,67 @@ export default function LogicSimulator() {
       from: { ...w.from, nodeId: idMap.get(w.from.nodeId)! },
       to: { ...w.to, nodeId: idMap.get(w.to.nodeId)! },
       points: w.points?.map((m) => ({ x: m.x + offset, y: m.y + offset })),
+      color: w.color,
     }))
     setNodes((ns) => [...ns, ...newNodes])
     setWires((ws) => [...ws, ...newWires])
     setSelected(new Set(newNodes.map((n) => n.id)))
     setSelectedWireId(null)
     setSelectedWireIds(new Set())
+  }
+
+  /**
+   * Ctrl+D — instantly clone selected nodes AND selected wires.
+   * Duplicates are offset by exactly +1 GRID on both axes and become selected.
+   */
+  const duplicateSelection = () => {
+    const nodeIds = new Set(live.current.selected)
+    const wireIds = new Set(live.current.selectedWireIds)
+    if (live.current.selectedWireId) wireIds.add(live.current.selectedWireId)
+    if (!nodeIds.size && !wireIds.size) return
+
+    // Include the endpoints of selected wires so the clone is coherent.
+    for (const w of live.current.wires) {
+      if (wireIds.has(w.id)) {
+        nodeIds.add(w.from.nodeId)
+        nodeIds.add(w.to.nodeId)
+      }
+    }
+
+    const offset = GRID
+    pushHistory()
+    const idMap = new Map<string, string>()
+    const newNodes = live.current.nodes.filter((n) => nodeIds.has(n.id)).map((n) => {
+      const newId = uid(n.kind.toLowerCase())
+      idMap.set(n.id, newId)
+      return {
+        ...n,
+        id: newId,
+        position: { x: snap(n.position.x + offset), y: snap(n.position.y + offset) },
+        inputs: n.inputs.map((p) => ({ ...p })),
+        outputs: n.outputs.map((p) => ({ ...p })),
+        unfoldedPinPos: n.unfoldedPinPos
+          ? { in: n.unfoldedPinPos.in.map((v) => ({ ...v })), out: n.unfoldedPinPos.out.map((v) => ({ ...v })) }
+          : undefined,
+      }
+    })
+    const newWires = live.current.wires.filter((w) =>
+      idMap.has(w.from.nodeId) && idMap.has(w.to.nodeId) && (
+        wireIds.size === 0 || wireIds.has(w.id)
+        || (nodeIds.has(w.from.nodeId) && nodeIds.has(w.to.nodeId))
+      ),
+    ).map((w) => ({
+      id: uid('w'),
+      from: { ...w.from, nodeId: idMap.get(w.from.nodeId)! },
+      to: { ...w.to, nodeId: idMap.get(w.to.nodeId)! },
+      points: w.points?.map((m) => ({ x: m.x + offset, y: m.y + offset })),
+      color: w.color,
+    }))
+    setNodes((ns) => [...ns, ...newNodes])
+    setWires((ws) => [...ws, ...newWires])
+    setSelected(new Set(newNodes.map((n) => n.id)))
+    setSelectedWireId(null)
+    setSelectedWireIds(new Set(newWires.map((w) => w.id)))
   }
 
   const openCreateModal = () => {
@@ -2660,12 +3005,6 @@ export default function LogicSimulator() {
     setChangeBlockModal(null)
   }
 
-  /**
-   * FIX [1]: rotateNode no longer calls setWires inside the setNodes
-   * updater and guards against undefined nodes.  Wire waypoints are
-   * recomputed with two orthogonal points that exit perpendicularly
-   * from the rotated pin wall.
-   */
   const rotateNode = useCallback((nodeId: string, delta: 90 | 180 | 270) => {
     pushHistory()
     const curNodes = live.current.nodes
@@ -2712,24 +3051,7 @@ export default function LogicSimulator() {
       const o = snapWirePoint(otherPt)
       const aSide = touchesFrom ? w.from.side : w.to.side
 
-      let stubX = 0
-      let stubY = 0
-      if (newRot === 0) {
-        stubX = aSide === 'in' ? -GRID : GRID
-      } else if (newRot === 90) {
-        stubY = aSide === 'in' ? -GRID : GRID
-      } else if (newRot === 180) {
-        stubX = aSide === 'in' ? GRID : -GRID
-      } else {
-        stubY = aSide === 'in' ? GRID : -GRID
-      }
-
-      const p1 = { x: a.x + stubX, y: a.y + stubY }
-      const p2 = (newRot === 0 || newRot === 180)
-        ? { x: a.x + stubX, y: o.y }
-        : { x: o.x, y: a.y + stubY }
-
-      const pts = collapsePolyline(ensureOrthogonalPolyline([a, p1, p2, o]))
+      const pts = perimeterRoute(rotatedNode, aSide, a, o)
       pts[0] = a
       pts[pts.length - 1] = o
       return { ...w, points: pts }
@@ -2809,6 +3131,7 @@ export default function LogicSimulator() {
     if (action === 'cut') cutSelection()
     else if (action === 'copy') copySelection()
     else if (action === 'paste') pasteClipboard()
+    else if (action === 'duplicate') duplicateSelection()
     else if (action === 'delete') {
       if (wireId && ctxMenu.target === 'wire') {
         pushHistory()
@@ -2850,6 +3173,17 @@ export default function LogicSimulator() {
     }
   }
 
+  const applyWireColor = (wireId: string, hex: string) => {
+    pushHistory()
+    setWires((ws) => ws.map((w) => w.id === wireId ? { ...w, color: hex } : w))
+    setWireColorModal(null)
+  }
+  const clearWireColor = (wireId: string) => {
+    pushHistory()
+    setWires((ws) => ws.map((w) => w.id === wireId ? { ...w, color: undefined } : w))
+    setWireColorModal(null)
+  }
+
   const clearAll = () => {
     if (editing) return
     pushHistory()
@@ -2866,7 +3200,7 @@ export default function LogicSimulator() {
       adjacency[root].push(key)
     }
     const data = {
-      version: 10,
+      version: 11,
       nodes,
       wires,
       junctions,
@@ -2933,10 +3267,10 @@ export default function LogicSimulator() {
   }
 
   const actionsRef = useRef({
-    undo, redo, copySelection, cutSelection, pasteClipboard, deleteSelection,
+    undo, redo, copySelection, cutSelection, pasteClipboard, deleteSelection, duplicateSelection,
   })
   useEffect(() => {
-    actionsRef.current = { undo, redo, copySelection, cutSelection, pasteClipboard, deleteSelection }
+    actionsRef.current = { undo, redo, copySelection, cutSelection, pasteClipboard, deleteSelection, duplicateSelection }
   })
 
   useEffect(() => {
@@ -2956,10 +3290,12 @@ export default function LogicSimulator() {
       if (mod && e.code === 'KeyC') { e.preventDefault(); actionsRef.current.copySelection(); return }
       if (mod && e.code === 'KeyV') { e.preventDefault(); actionsRef.current.pasteClipboard(); return }
       if (mod && e.code === 'KeyX') { e.preventDefault(); actionsRef.current.cutSelection(); return }
+      if (mod && e.code === 'KeyD') { e.preventDefault(); actionsRef.current.duplicateSelection(); return }
       if (e.key === 'Escape') {
         drawing.current = null
         setPlacement(null); setCreateModal(false)
         setClockModal(null); setRenamePinModal(null); setChangeBlockModal(null); setCtxMenu(null); setPaletteCtxMenu(null)
+        setWireColorModal(null)
         setSelected(new Set()); setSelectedWireId(null); setSelectedWireIds(new Set())
       }
       if ((e.key === 'Delete' || e.key === 'Backspace')
@@ -3066,7 +3402,8 @@ export default function LogicSimulator() {
 
       drawScene(ctx, cw, ch, dpr, s.camera, s.nodes, s.wires, s.junctions, signal.current,
         s.selected, s.selectedWireId, s.selectedWireIds, hoverWire.current,
-        chipMeta, chipById, drawingPreview, bridgeCrossings.current, box, placingNode, theme, dark)
+        chipMeta, chipById, drawingPreview, bridgeCrossings.current, box, placingNode,
+        hoverSegment.current, theme, dark)
     }
     loop()
     return () => cancelAnimationFrame(raf)
@@ -3091,6 +3428,8 @@ export default function LogicSimulator() {
     return { left, top }
   }
 
+  const currentWire = ctxMenu?.wireId ? wires.find((w) => w.id === ctxMenu.wireId) : null
+
   return (
     <div className={`flex h-screen w-screen flex-col overflow-hidden ${dark ? 'bg-slate-900 text-slate-100' : 'bg-slate-100 text-slate-800'}`}>
       <header className={`flex h-11 shrink-0 items-center gap-2 border-b px-3 shadow-sm ${dark ? 'border-slate-700 bg-slate-800' : 'border-slate-200 bg-white'}`}>
@@ -3109,7 +3448,7 @@ export default function LogicSimulator() {
             <span className="text-[11px] opacity-50">Edit mode — double-click pins to rename</span>
             <div className="flex-1" />
             <button onClick={() => exitEditChip(false)} className={`${btn} ${idle}`}>Cancel</button>
-            <button onClick={() => exitEditChip(true)} className={`${btn} bg-emerald-50 text-emerald-700`}>Save & Close</button>
+            <button onClick={() => exitEditChip(true)} className={`${btn} bg-emerald-50 text-emerald-700`}>Save &amp; Close</button>
           </div>
         ) : (
           <>
@@ -3260,15 +3599,38 @@ export default function LogicSimulator() {
       {ctxMenu && (
         <div
           className={`fixed z-50 overflow-hidden rounded-lg border py-1 shadow-xl ${dark ? 'border-slate-600 bg-slate-800' : 'border-slate-200 bg-white'}`}
-          style={clampMenuPos(ctxMenu.x, ctxMenu.y, 240, 360)}
+          style={clampMenuPos(ctxMenu.x, ctxMenu.y, 260, 460)}
           onMouseLeave={() => setCtxMenu(null)}
         >
-          {ctxMenu.target === 'wire' ? (
+          {ctxMenu.target === 'wire' && currentWire ? (
             <>
               <button className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-red-500 hover:bg-red-50"
                 onClick={() => ctxAction('delete')}>
                 <Trash2 size={14} /> Delete wire
               </button>
+              <div className={`my-1 border-t ${dark ? 'border-slate-600' : 'border-slate-100'}`} />
+              <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider opacity-50">Wire Color (ON)</div>
+              <div className="flex flex-wrap gap-1.5 px-3 pb-2">
+                {WIRE_PRESET_COLORS.map((c) => (
+                  <button key={c}
+                    onClick={() => applyWireColor(currentWire.id, c)}
+                    className={`h-5 w-5 rounded-full ring-2 transition ${currentWire.color === c ? 'ring-slate-800 dark:ring-white' : 'ring-transparent hover:ring-slate-400'}`}
+                    style={{ background: c }} />
+                ))}
+              </div>
+              <div className="flex items-center gap-2 px-3 pb-2">
+                <input type="color"
+                  value={currentWire.color ?? '#2563eb'}
+                  onChange={(e) => applyWireColor(currentWire.id, e.target.value)}
+                  className="h-7 w-10 cursor-pointer rounded border-0"
+                />
+                <span className="text-[11px] opacity-60">Custom hex</span>
+              </div>
+              {currentWire.color && (
+                <button className={menuItemCls} onClick={() => clearWireColor(currentWire.id)}>
+                  <RotateCcw size={14} /> Reset to theme default
+                </button>
+              )}
             </>
           ) : (
             <>
@@ -3276,6 +3638,7 @@ export default function LogicSimulator() {
                 { a: 'cut', icon: <Scissors size={14} />, label: 'Cut', k: 'Ctrl+X' },
                 { a: 'copy', icon: <Copy size={14} />, label: 'Copy', k: 'Ctrl+C' },
                 { a: 'paste', icon: <ClipboardPaste size={14} />, label: 'Paste', k: 'Ctrl+V' },
+                { a: 'duplicate', icon: <Copy size={14} />, label: 'Duplicate', k: 'Ctrl+D' },
               ].map((item) => (
                 <button key={item.a} className={menuItemCls} onClick={() => ctxAction(item.a)}>
                   {item.icon} {item.label}
@@ -3334,10 +3697,10 @@ export default function LogicSimulator() {
                     <RotateCw size={14} /> Rotate 90°
                   </button>
                   <button className={menuItemCls} onClick={() => ctxAction('rotate180')}>
-                    <RotateCw size={14} /> Rotate 180°
+                    <FlipHorizontal size={14} /> Rotate 180°
                   </button>
                   <button className={menuItemCls} onClick={() => ctxAction('rotate270')}>
-                    <RotateCw size={14} /> Rotate 270°
+                    <RotateCcw size={14} /> Rotate 270°
                   </button>
                 </>
               )}
@@ -3355,10 +3718,10 @@ export default function LogicSimulator() {
                     <RotateCw size={14} /> Rotate 90°
                   </button>
                   <button className={menuItemCls} onClick={() => ctxAction('rotate180')}>
-                    <RotateCw size={14} /> Rotate 180°
+                    <FlipHorizontal size={14} /> Rotate 180°
                   </button>
                   <button className={menuItemCls} onClick={() => ctxAction('rotate270')}>
-                    <RotateCw size={14} /> Rotate 270°
+                    <RotateCcw size={14} /> Rotate 270°
                   </button>
                 </>
               )}
@@ -3505,6 +3868,22 @@ export default function LogicSimulator() {
 
             <div className="mt-3 flex justify-end">
               <button onClick={() => setChangeBlockModal(null)} className={`${btn} ${idle}`}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {wireColorModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className={`w-72 rounded-xl border p-5 shadow-xl ${dark ? 'border-slate-600 bg-slate-800' : 'border-slate-200 bg-white'}`}>
+            <h2 className="mb-3 text-sm font-semibold">Wire Color</h2>
+            <input type="color" value={wireColorModal.hex}
+              onChange={(e) => setWireColorModal({ ...wireColorModal, hex: e.target.value })}
+              className="mb-4 h-10 w-full cursor-pointer rounded border-0" />
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setWireColorModal(null)} className={`${btn} ${idle}`}>Cancel</button>
+              <button onClick={() => applyWireColor(wireColorModal.wireId, wireColorModal.hex)}
+                className={`${btn} bg-blue-50 text-blue-700`}>Apply</button>
             </div>
           </div>
         </div>
